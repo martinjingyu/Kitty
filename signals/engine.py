@@ -74,18 +74,25 @@ class Signal:
 # ── polygon REST helper ───────────────────────────────────────────────────────
 
 def _fetch_latest_minute(ticker: str, n_bars: int = 3) -> list:
-    """Fetch the last n_bars 1-minute aggregates for ticker."""
-    now   = datetime.now(timezone.utc)
-    start = (now - timedelta(minutes=n_bars + 5)).strftime("%Y-%m-%d")
-    end   = now.strftime("%Y-%m-%d")
-    url   = f"{BASE_URL}/v2/aggs/ticker/{ticker}/range/1/minute/{start}/{end}"
+    """
+    Fetch the last n_bars 1-minute aggregates for ticker.
+    Uses exact millisecond timestamps so we always get the most recent bars,
+    not the first bars of the trading day.
+    """
+    now      = datetime.now(timezone.utc)
+    from_ms  = int((now - timedelta(minutes=n_bars + 10)).timestamp() * 1000)
+    to_ms    = int(now.timestamp() * 1000)
+    url      = f"{BASE_URL}/v2/aggs/ticker/{ticker}/range/1/minute/{from_ms}/{to_ms}"
     try:
         resp = requests.get(url, params={
             "adjusted": "true", "sort": "asc",
-            "limit": n_bars + 5, "apiKey": API_KEY,
+            "limit": n_bars + 10, "apiKey": API_KEY,
         }, timeout=10)
-        data = resp.json()
-        return data.get("results", [])[-n_bars:]
+        data    = resp.json()
+        results = data.get("results", [])
+        log.debug(f"{ticker}: fetched {len(results)} minute bars "
+                  f"(status={data.get('status')})")
+        return results[-n_bars:]
     except Exception as e:
         log.warning(f"Polygon fetch failed for {ticker}: {e}")
         return []

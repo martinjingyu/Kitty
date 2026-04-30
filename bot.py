@@ -129,17 +129,137 @@ async def status(ctx: commands.Context):
 @bot.command(name="signal")
 async def force_signal(ctx: commands.Context):
     """Force-poll all tickers right now (for testing)."""
-    await ctx.send("Polling tickers ...")
+    import requests as _req
+    from signals.engine import API_KEY, BASE_URL, SIGNAL_CONFIG
+    from datetime import timezone, timedelta
+
+    now     = datetime.datetime.now(datetime.timezone.utc)
+    from_ms = int((now - datetime.timedelta(minutes=15)).timestamp() * 1000)
+    to_ms   = int(now.timestamp() * 1000)
+
+    # show what data Polygon actually has right now
+    lines = [f"**Polling** `{now.strftime('%H:%M:%S')} UTC`", ""]
+    for ticker in SIGNAL_CONFIG:
+        url  = f"{BASE_URL}/v2/aggs/ticker/{ticker}/range/1/minute/{from_ms}/{to_ms}"
+        resp = _req.get(url, params={"sort":"asc","limit":5,"apiKey":API_KEY}, timeout=8)
+        data = resp.json()
+        bars = data.get("results", [])
+        if bars:
+            last_ts = datetime.datetime.fromtimestamp(
+                bars[-1]["t"] / 1000, tz=datetime.timezone.utc
+            ).strftime("%H:%M")
+            lines.append(f"`{ticker}` — {len(bars)} bar(s), last @ {last_ts} UTC  "
+                         f"close=${bars[-1]['c']:.2f}")
+        else:
+            lines.append(f"`{ticker}` — 市场已收盘 / 无最新数据")
+
+    await ctx.send("\n".join(lines))
+
+    # now actually poll for signals
     try:
         signals = engine.poll()
     except Exception as e:
-        await ctx.send(f"Error: {e}")
+        await ctx.send(f"Engine error: {e}")
         return
+
     if signals:
         for sig in signals:
             await ctx.send(format_signal(sig))
     else:
-        await ctx.send("No signals above threshold right now.")
+        await ctx.send("概率未达阈值，暂无信号。（市场收盘后不产生新 bar）")
+
+
+@bot.command(name="analyze")
+async def analyze(ctx: commands.Context, ticker: str = None):
+    """
+    Run a full model analysis using the latest bar from saved parquet data.
+    Shows predict_proba for every model regardless of threshold.
+
+    Usage:
+      !analyze          — analyze all tickers
+      !analyze SPY      — analyze one ticker
+    """
+    import pickle
+    import pandas as pd
+    import numpy as np
+    from collections import deque
+    from signals.engine import (
+        SIGNAL_CONFIG, MODEL_DIR, BARS_DIR, HISTORY_LEN,
+        _compute_features, _rolling_vol,
+    )
+
+    tickers = [ticker.upper()] if ticker else list(SIGNAL_CONFIG.keys())
+    await ctx.send(f"分析中，请稍候...")
+
+    for t in tickers:
+        bar_path = BARS_DIR / f"{t}_dollar_bars.parquet"
+        if not bar_path.exists():
+            await ctx.send(f"`{t}` — 找不到 bar 数据，请先运行 pipeline")
+            continue
+
+        df      = pd.read_parquet(bar_path)
+        history = deque(df.tail(HISTORY_LEN).to_dict("records"), maxlen=HISTORY_LEN)
+        last    = df.iloc[-1]
+        bar_ts  = pd.Timestamp(last["timestamp"])
+        price   = last["close"]
+
+        lines = [
+            f"**── {t} 分析报告 ──**",
+            f"最新 bar: `{bar_ts.strftime('%Y-%m-%d %H:%M')} UTC`  "
+            f"收盘价 `${price:,.2f}`",
+            "",
+        ]
+
+        for regime, thr, h, vol_lb, max_hold in SIGNAL_CONFIG.get(t, []):
+            model_path = MODEL_DIR / f"{t}_rf_{regime}.pkl"
+            if not model_path.exists():
+                lines.append(f"`{regime}` — 模型文件不存在")
+                continue
+
+            with open(model_path, "rb") as f:
+                obj = pickle.load(f)
+
+            cfg       = obj["config"]
+            model     = obj["model"]
+            feat_cols = obj["features"]
+
+            feats = _compute_features(history, feat_cols, cfg)
+            if feats is None:
+                lines.append(f"`{regime}` — 历史数据不足，无法计算特征")
+                continue
+
+            proba_long  = float(model.predict_proba(feats)[0, 1])
+            proba_short = 1 - proba_long
+            vol         = _rolling_vol(history, vol_lb)
+
+            target = price * (1 + h * vol)
+            stop   = price * (1 - h * vol)
+
+            # direction indicator
+            if proba_long > thr:
+                verdict = "📈 **LONG 信号**"
+                conf    = proba_long
+            elif proba_short > thr:
+                verdict = "📉 **SHORT 信号**"
+                conf    = proba_short
+            else:
+                verdict = "⬜ 未达阈值"
+                conf    = max(proba_long, proba_short)
+
+            regime_cn = "1 周" if regime == "weekly" else "1 个月"
+            days      = max_hold // 20
+
+            lines += [
+                f"**{regime_cn}模型**  (阈值 {thr})",
+                f"  P(多) `{proba_long:.1%}`  P(空) `{proba_short:.1%}`  → {verdict}",
+                f"  置信度 `{conf:.1%}`  |  波动率 `{vol*100:.2f}%/bar`",
+                f"  目标价 `${target:,.2f}` (+{(target/price-1)*100:.2f}%)  "
+                f"止损价 `${stop:,.2f}` ({(stop/price-1)*100:.2f}%)",
+                f"  持仓周期 {regime_cn} (~{days} 交易日)",
+                "",
+            ]
+
+        await ctx.send("\n".join(lines))
 
 
 # ── entry point ───────────────────────────────────────────────────────────────
