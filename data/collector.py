@@ -35,6 +35,23 @@ def _get(url: str, params: dict, retries: int = 5) -> dict:
     raise RuntimeError("Max retries exceeded on rate limit")
 
 
+def _find_cache(ticker: str, start: str, end: str) -> Path | None:
+    """
+    Return the best existing cache file for this ticker + start date.
+    Picks the file whose end date is latest (closest to `end`).
+    We don't require file_end >= end: a file that is a few days old is
+    still valid for training and avoids unnecessary re-downloads.
+    """
+    exact = RAW_DIR / f"{ticker}_1m_{start}_{end}.parquet"
+    if exact.exists():
+        return exact
+
+    candidates = list(RAW_DIR.glob(f"{ticker}_1m_{start}_*.parquet"))
+    if candidates:
+        return max(candidates, key=lambda p: p.stem.split("_")[-1])
+    return None
+
+
 def fetch_minute_aggs(
     ticker: str = TICKER,
     start: str = "2021-04-29",
@@ -43,11 +60,14 @@ def fetch_minute_aggs(
     """
     Fetch 1-minute OHLCV aggregates from Polygon.io with auto-pagination.
     Results are cached as parquet — subsequent calls return instantly.
+
+    Cache lookup is fuzzy: any existing file for this ticker + start date
+    that covers at least up to `end` is accepted (latest end wins).
     """
-    cache_path = RAW_DIR / f"{ticker}_1m_{start}_{end}.parquet"
-    if cache_path.exists():
-        print(f"Loading from cache: {cache_path}")
-        return pd.read_parquet(cache_path)
+    cached = _find_cache(ticker, start, end)
+    if cached:
+        print(f"Loading from cache: {cached.name}")
+        return pd.read_parquet(cached)
 
     print(f"Fetching {ticker} 1-minute bars {start} → {end} from Polygon.io ...")
     print(f"(Free tier: ~13s between pages — this may take a few minutes)")
@@ -80,8 +100,9 @@ def fetch_minute_aggs(
     df = df[["timestamp", "open", "high", "low", "close", "volume", "vwap"]].copy()
     df = df.sort_values("timestamp").reset_index(drop=True)
 
-    df.to_parquet(cache_path, index=False)
-    print(f"Saved {len(df):,} rows → {cache_path}")
+    save_path = RAW_DIR / f"{ticker}_1m_{start}_{end}.parquet"
+    df.to_parquet(save_path, index=False)
+    print(f"Saved {len(df):,} rows → {save_path}")
     return df
 
 

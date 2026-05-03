@@ -13,12 +13,24 @@ from data.bars import volume, dollar, runs, imbalance
 BARS_PER_DAY = 20
 
 
-def build_bars(ticker: str, start: str = "2021-04-29", end: str = "2026-04-29") -> dict:
+ROLLING_WINDOW = 20   # trailing trading days for adaptive threshold
+
+
+def build_bars(
+    ticker: str,
+    start: str = "2021-04-29",
+    end: str = "2026-04-29",
+    force: bool = False,
+) -> dict:
     """
-    Fetch minute data and compute all 4 bar types.
+    Fetch minute data and compute all 4 bar types with rolling thresholds.
     Returns dict of {bar_type: DataFrame}.
     Bars are cached as parquet under data/bars/processed/.
+
+    force – if True, ignore cached parquet files and rebuild from scratch.
     """
+    import pandas as pd
+
     out_dir = Path("data/bars/processed")
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -27,22 +39,27 @@ def build_bars(ticker: str, start: str = "2021-04-29", end: str = "2026-04-29") 
     print(f"\n{ticker} raw data: {len(df):,} rows | "
           f"{df['timestamp'].min().date()} → {df['timestamp'].max().date()} "
           f"({trading_days} trading days)")
-    print(f"Target: ~{BARS_PER_DAY} bars/day\n")
+    print(f"Target: ~{BARS_PER_DAY} bars/day  "
+          f"(rolling window: {ROLLING_WINDOW} days)\n")
 
     tasks = [
-        ("volume",    lambda: volume.compute(df,    bars_per_day=BARS_PER_DAY)),
-        ("dollar",    lambda: dollar.compute(df,    bars_per_day=BARS_PER_DAY)),
-        ("runs",      lambda: runs.compute(df,      bars_per_day=BARS_PER_DAY)),
-        ("imbalance", lambda: imbalance.compute(df, bars_per_day=BARS_PER_DAY)),
+        ("volume",    lambda: volume.compute(df,    bars_per_day=BARS_PER_DAY,
+                                             window_days=ROLLING_WINDOW)),
+        ("dollar",    lambda: dollar.compute(df,    bars_per_day=BARS_PER_DAY,
+                                             window_days=ROLLING_WINDOW)),
+        ("runs",      lambda: runs.compute(df,      bars_per_day=BARS_PER_DAY,
+                                           window_days=ROLLING_WINDOW)),
+        ("imbalance", lambda: imbalance.compute(df, bars_per_day=BARS_PER_DAY,
+                                                window_days=ROLLING_WINDOW)),
     ]
 
     result = {}
     for name, fn in tasks:
         path = out_dir / f"{ticker}_{name}_bars.parquet"
-        if path.exists():
-            import pandas as pd
+        if path.exists() and not force:
             bar_df = pd.read_parquet(path)
-            print(f"  {name}: loaded from cache ({len(bar_df):,} bars)")
+            print(f"  {name}: loaded from cache ({len(bar_df):,} bars)  "
+                  f"[use --force to rebuild]")
         else:
             bar_df = fn()
             bar_df.to_parquet(path, index=False)
@@ -59,5 +76,7 @@ if __name__ == "__main__":
     parser.add_argument("--ticker", default="SPY")
     parser.add_argument("--start",  default="2021-04-29")
     parser.add_argument("--end",    default="2026-04-29")
+    parser.add_argument("--force",  action="store_true",
+                        help="Delete cached bars and rebuild from raw data")
     args = parser.parse_args()
-    build_bars(args.ticker, args.start, args.end)
+    build_bars(args.ticker, args.start, args.end, force=args.force)

@@ -24,13 +24,13 @@ END   = str(date.today())
 START = "2021-01-01"   # Polygon free tier returns what it has
 
 
-def run(ticker: str):
+def run(ticker: str, force: bool = False):
     print(f"\n{'▓'*60}")
     print(f"  PIPELINE: {ticker}")
     print(f"{'▓'*60}\n")
 
     # step 1 & 2: fetch + build bars
-    bars = build_bars(ticker, start=START, end=END)
+    bars = build_bars(ticker, start=START, end=END, force=force)
 
     # step 3: train models
     train_ticker(ticker, bars)
@@ -40,10 +40,12 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--tickers", nargs="+", required=True,
                         help="List of tickers, e.g. --tickers SNDK CRWV")
+    parser.add_argument("--force", action="store_true",
+                        help="Ignore cached bars and rebuild from raw data")
     args = parser.parse_args()
 
     for ticker in args.tickers:
-        run(ticker.upper())
+        run(ticker.upper(), force=args.force)
 
     print("\nAll tickers done.")
 

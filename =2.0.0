@@ -1,0 +1,6 @@
+Collecting xgboost
+  Downloading xgboost-3.2.0-py3-none-manylinux_2_28_x86_64.whl.metadata (2.1 kB)
+Requirement already satisfied: numpy in /home/jingyuh/myenv/lib/python3.10/site-packages (from xgboost) (2.2.6)
+Requirement already satisfied: nvidia-nccl-cu12 in /home/jingyuh/myenv/lib/python3.10/site-packages (from xgboost) (2.21.5)
+Requirement already satisfied: scipy in /home/jingyuh/myenv/lib/python3.10/site-packages (from xgboost) (1.15.3)
+Downloading xgboost-3.2.0-py3-none-manylinux_2_28_x86_64.whl (131.7 MB)
