@@ -424,15 +424,16 @@ async def analyze(ctx: commands.Context, ticker: str = None):
     await ctx.send("分析中，请稍候...")
 
     def _analyze_ticker(t: str) -> str:
+        import pandas as pd
+        from collections import deque
+        from signals.engine import HISTORY_LEN
+
         # Prefer live engine history (updated by poll); fall back to parquet if engine not ready
         history = engine.histories.get(t) if engine else None
         if not history:
             bar_path = BARS_DIR / f"{t}_dollar_bars.parquet"
             if not bar_path.exists():
                 return f"`{t}` — 找不到 bar 数据，请先运行 pipeline"
-            import pandas as pd
-            from collections import deque
-            from signals.engine import HISTORY_LEN
             df      = pd.read_parquet(bar_path)
             history = deque(df.tail(HISTORY_LEN).to_dict("records"), maxlen=HISTORY_LEN)
 
