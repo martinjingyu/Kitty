@@ -363,31 +363,25 @@ async def cmd_positions(ctx: commands.Context):
 @bot.command(name="signal")
 async def force_signal(ctx: commands.Context):
     """Force-poll all tickers right now (for testing)."""
-    import requests as _req
-    from signals.engine import API_KEY, BASE_URL, SIGNAL_CONFIG
-    from datetime import timezone, timedelta
+    import yfinance as yf
+    from signals.engine import SIGNAL_CONFIG
 
-    now     = datetime.datetime.now(datetime.timezone.utc)
-    from_ms = int((now - datetime.timedelta(minutes=15)).timestamp() * 1000)
-    to_ms   = int(now.timestamp() * 1000)
+    now  = datetime.datetime.now(datetime.timezone.utc)
+    diag = [f"**Polling** `{now.strftime('%H:%M:%S')} UTC`", ""]
 
-    # show what data Polygon actually has right now
-    lines = [f"**Polling** `{now.strftime('%H:%M:%S')} UTC`", ""]
     for ticker in SIGNAL_CONFIG:
-        url  = f"{BASE_URL}/v2/aggs/ticker/{ticker}/range/1/minute/{from_ms}/{to_ms}"
-        resp = _req.get(url, params={"sort":"asc","limit":5,"apiKey":API_KEY}, timeout=8)
-        data = resp.json()
-        bars = data.get("results", [])
-        if bars:
-            last_ts = datetime.datetime.fromtimestamp(
-                bars[-1]["t"] / 1000, tz=datetime.timezone.utc
-            ).strftime("%H:%M")
-            lines.append(f"`{ticker}` — {len(bars)} bar(s), last @ {last_ts} UTC  "
-                         f"close=${bars[-1]['c']:.2f}")
-        else:
-            lines.append(f"`{ticker}` — 市场已收盘 / 无最新数据")
+        try:
+            df = yf.Ticker(ticker).history(period="1d", interval="1m")
+            if df.empty:
+                diag.append(f"`{ticker}` — 无数据")
+            else:
+                last = df.iloc[-1]
+                ts   = df.index[-1].tz_convert("UTC").strftime("%H:%M")
+                diag.append(f"`{ticker}` — last @ {ts} UTC  close=`${last['Close']:.2f}`")
+        except Exception as e:
+            diag.append(f"`{ticker}` — 抓取失败: {e}")
 
-    await ctx.send("\n".join(lines))
+    await ctx.send("\n".join(diag))
 
     # now actually poll for signals (in executor — XGBoost is CPU-blocking)
     loop = asyncio.get_event_loop()
@@ -411,7 +405,7 @@ async def force_signal(ctx: commands.Context):
 @bot.command(name="analyze")
 async def analyze(ctx: commands.Context, ticker: str = None):
     """
-    Run a full model analysis using the latest bar from saved parquet data.
+    Run a full model analysis using the latest bar from the live engine history.
     Shows predict_proba for every model regardless of threshold.
 
     Usage:
@@ -421,9 +415,8 @@ async def analyze(ctx: commands.Context, ticker: str = None):
     import pickle
     import pandas as pd
     import numpy as np
-    from collections import deque
     from signals.engine import (
-        SIGNAL_CONFIG, MODEL_DIR, BARS_DIR, HISTORY_LEN,
+        SIGNAL_CONFIG, MODEL_DIR, BARS_DIR,
         _compute_features, _rolling_vol,
     )
 
@@ -431,15 +424,21 @@ async def analyze(ctx: commands.Context, ticker: str = None):
     await ctx.send("分析中，请稍候...")
 
     def _analyze_ticker(t: str) -> str:
-        bar_path = BARS_DIR / f"{t}_dollar_bars.parquet"
-        if not bar_path.exists():
-            return f"`{t}` — 找不到 bar 数据，请先运行 pipeline"
+        # Prefer live engine history (updated by poll); fall back to parquet if engine not ready
+        history = engine.histories.get(t) if engine else None
+        if not history:
+            bar_path = BARS_DIR / f"{t}_dollar_bars.parquet"
+            if not bar_path.exists():
+                return f"`{t}` — 找不到 bar 数据，请先运行 pipeline"
+            import pandas as pd
+            from collections import deque
+            from signals.engine import HISTORY_LEN
+            df      = pd.read_parquet(bar_path)
+            history = deque(df.tail(HISTORY_LEN).to_dict("records"), maxlen=HISTORY_LEN)
 
-        df      = pd.read_parquet(bar_path)
-        history = deque(df.tail(HISTORY_LEN).to_dict("records"), maxlen=HISTORY_LEN)
-        last    = df.iloc[-1]
-        bar_ts  = pd.Timestamp(last["timestamp"])
-        price   = last["close"]
+        last   = history[-1]
+        bar_ts = pd.Timestamp(last["timestamp"])
+        price  = last["close"]
 
         lines = [
             f"**── {t} 分析报告 ──**",

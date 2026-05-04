@@ -2,7 +2,7 @@
 Real-time signal engine.
 
 Every minute:
-  1. Fetch latest 1-min bar from Polygon for each ticker
+  1. Fetch latest 1-min bars via yfinance for each ticker
   2. Feed into DollarBarAccumulator
   3. When a dollar bar closes → compute features → predict_proba
   4. If prob > threshold → emit Signal
@@ -12,7 +12,6 @@ the model was trained with, so they are consistent with triple-barrier labels.
 """
 import os
 import pickle
-import time
 import logging
 from collections import deque
 from dataclasses import dataclass, field
@@ -22,13 +21,14 @@ from typing import Optional
 
 import numpy as np
 import pandas as pd
-import requests
+import yfinance as yf
 from dotenv import load_dotenv
 
 load_dotenv()
 
 log = logging.getLogger(__name__)
 
+# Polygon constants kept for pipeline scripts that import them
 API_KEY  = os.getenv("POLYGON_API_KEY")
 BASE_URL = "https://api.polygon.io"
 
@@ -97,28 +97,34 @@ class ProbaScan:
 
 # ── polygon REST helper ───────────────────────────────────────────────────────
 
-def _fetch_latest_minute(ticker: str, n_bars: int = 3) -> list:
+def _fetch_latest_minute(ticker: str, n_bars: int = 5) -> list:
     """
-    Fetch the last n_bars 1-minute aggregates for ticker.
-    Uses exact millisecond timestamps so we always get the most recent bars,
-    not the first bars of the trading day.
+    Fetch the most recent n_bars 1-minute bars via yfinance.
+    Returns a list of dicts with keys: t, o, h, l, c, v, n (epoch-ms timestamp).
     """
-    now      = datetime.now(timezone.utc)
-    from_ms  = int((now - timedelta(minutes=n_bars + 10)).timestamp() * 1000)
-    to_ms    = int(now.timestamp() * 1000)
-    url      = f"{BASE_URL}/v2/aggs/ticker/{ticker}/range/1/minute/{from_ms}/{to_ms}"
     try:
-        resp = requests.get(url, params={
-            "adjusted": "true", "sort": "asc",
-            "limit": n_bars + 10, "apiKey": API_KEY,
-        }, timeout=10)
-        data    = resp.json()
-        results = data.get("results", [])
-        log.debug(f"{ticker}: fetched {len(results)} minute bars "
-                  f"(status={data.get('status')})")
-        return results[-n_bars:]
+        df = yf.Ticker(ticker).history(period="1d", interval="1m")
+        if df.empty:
+            log.debug(f"{ticker}: yfinance returned empty dataframe")
+            return []
+        df = df.tail(n_bars)
+        rows = []
+        for ts, row in df.iterrows():
+            # yfinance index is timezone-aware; convert to UTC epoch ms
+            epoch_ms = int(ts.tz_convert("UTC").timestamp() * 1000)
+            rows.append({
+                "t": epoch_ms,
+                "o": float(row["Open"]),
+                "h": float(row["High"]),
+                "l": float(row["Low"]),
+                "c": float(row["Close"]),
+                "v": float(row["Volume"]),
+                "n": 1,
+            })
+        log.debug(f"{ticker}: fetched {len(rows)} minute bars via yfinance")
+        return rows
     except Exception as e:
-        log.warning(f"Polygon fetch failed for {ticker}: {e}")
+        log.warning(f"yfinance fetch failed for {ticker}: {e}")
         return []
 
 
@@ -305,6 +311,7 @@ class SignalEngine:
     def poll(self) -> list[Signal]:
         """
         Fetch latest minute bars for all tickers.
+        Sleeps 12s between tickers to stay under Polygon free-tier 5 req/min limit.
         Returns Signal objects when model direction changes above threshold.
         """
         all_events = []
