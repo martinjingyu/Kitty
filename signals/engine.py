@@ -95,37 +95,47 @@ class ProbaScan:
     timestamp:     datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
 
-# ── polygon REST helper ───────────────────────────────────────────────────────
+# ── yfinance helpers ─────────────────────────────────────────────────────────
 
-def _fetch_latest_minute(ticker: str, n_bars: int = 5) -> list:
+def _yf_to_internal(ts_idx, row: "pd.Series") -> dict:
+    """Convert a yfinance DataFrame row to the engine's internal minute-bar dict."""
+    utc_dt = ts_idx.tz_convert("UTC").to_pydatetime()
+    return {
+        "timestamp":   utc_dt,
+        "open":        float(row["Open"]),
+        "high":        float(row["High"]),
+        "low":         float(row["Low"]),
+        "close":       float(row["Close"]),
+        "volume":      float(row["Volume"]),
+        "dollar":      float(row["Close"]) * float(row["Volume"]),
+        "ticks":       1,
+        "buy_dollar":  0.0,
+        "sell_dollar": 0.0,
+        "theta":       0.0,
+    }
+
+
+def _fetch_yf(ticker: str, since_utc: Optional[datetime] = None) -> "pd.DataFrame":
     """
-    Fetch the most recent n_bars 1-minute bars via yfinance.
-    Returns a list of dicts with keys: t, o, h, l, c, v, n (epoch-ms timestamp).
+    Fetch 1-min bars from yfinance.
+    Uses period-based requests to avoid timezone issues with yfinance's start param.
+    since_utc filtering is done on the returned DataFrame index.
     """
     try:
-        df = yf.Ticker(ticker).history(period="1d", interval="1m")
+        # warmup may need several days of history; poll only needs today
+        period = "7d" if since_utc is None or (
+            datetime.now(timezone.utc) - since_utc
+        ).days >= 1 else "1d"
+        df = yf.Ticker(ticker).history(period=period, interval="1m")
         if df.empty:
-            log.debug(f"{ticker}: yfinance returned empty dataframe")
-            return []
-        df = df.tail(n_bars)
-        rows = []
-        for ts, row in df.iterrows():
-            # yfinance index is timezone-aware; convert to UTC epoch ms
-            epoch_ms = int(ts.tz_convert("UTC").timestamp() * 1000)
-            rows.append({
-                "t": epoch_ms,
-                "o": float(row["Open"]),
-                "h": float(row["High"]),
-                "l": float(row["Low"]),
-                "c": float(row["Close"]),
-                "v": float(row["Volume"]),
-                "n": 1,
-            })
-        log.debug(f"{ticker}: fetched {len(rows)} minute bars via yfinance")
-        return rows
+            return df
+        if since_utc is not None:
+            since_epoch = since_utc.timestamp()
+            df = df[df.index.tz_convert("UTC").map(lambda t: t.timestamp()) > since_epoch]
+        return df
     except Exception as e:
         log.warning(f"yfinance fetch failed for {ticker}: {e}")
-        return []
+        return pd.DataFrame()
 
 
 # ── dollar bar accumulator ────────────────────────────────────────────────────
@@ -306,44 +316,97 @@ class SignalEngine:
                 threshold = 1e8   # fallback
             self.accumulators[ticker] = DollarBarAccumulator(threshold)
 
+    def _last_bar_utc(self, ticker: str) -> Optional[datetime]:
+        """Return the UTC datetime of the most recent dollar bar in history."""
+        hist = self.histories.get(ticker)
+        if not hist:
+            return None
+        ts = hist[-1]["timestamp"]
+        if isinstance(ts, pd.Timestamp):
+            return ts.tz_convert("UTC").to_pydatetime()
+        if isinstance(ts, datetime):
+            return ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
+        return None
+
+    def _save_bars(self, ticker: str, new_bars: list):
+        """Append new dollar bars to the parquet file on disk."""
+        path = BARS_DIR / f"{ticker}_dollar_bars.parquet"
+        new_df = pd.DataFrame(new_bars)
+        if path.exists():
+            existing = pd.read_parquet(path)
+            combined = pd.concat([existing, new_df], ignore_index=True)
+            combined.to_parquet(path, index=False)
+        else:
+            new_df.to_parquet(path, index=False)
+        log.info(f"{ticker}: saved {len(new_bars)} new dollar bars to parquet")
+
+    def _ingest_df(self, ticker: str, df: pd.DataFrame) -> list:
+        """
+        Feed a yfinance minute-bar DataFrame into the accumulator.
+        Skips rows already seen (based on last_ts).
+        Returns list of newly closed dollar bars.
+        """
+        new_dollar_bars = []
+        for ts_idx, row in df.iterrows():
+            epoch_ms = int(ts_idx.tz_convert("UTC").timestamp() * 1000)
+            if self.last_ts[ticker] and epoch_ms <= self.last_ts[ticker]:
+                continue
+            self.last_ts[ticker] = epoch_ms
+            bar_row = _yf_to_internal(ts_idx, row)
+            new_bar = self.accumulators[ticker].add(bar_row)
+            if new_bar:
+                self.histories[ticker].append(new_bar)
+                new_dollar_bars.append(new_bar)
+        return new_dollar_bars
+
+    def warmup(self):
+        """
+        Gap-fill: fetch minute bars from the last saved dollar bar up to now,
+        close new dollar bars, and persist them to parquet.
+        Called once at startup in a thread executor.
+        """
+        for ticker in self.tickers:
+            try:
+                last_utc = self._last_bar_utc(ticker)
+                df = _fetch_yf(ticker, since_utc=last_utc)
+                if df.empty:
+                    log.info(f"{ticker}: warmup — no new bars since {last_utc}")
+                    continue
+                new_bars = self._ingest_df(ticker, df)
+                if new_bars:
+                    self._save_bars(ticker, new_bars)
+                latest = self.histories[ticker][-1]
+                log.info(f"{ticker}: warmup — {len(new_bars)} new dollar bars, "
+                         f"histories={len(self.histories[ticker])}, "
+                         f"latest close={latest['close']:.2f} @ {latest['timestamp']}")
+            except Exception as e:
+                log.warning(f"{ticker}: warmup failed: {e}", exc_info=True)
+
     # ── public API ────────────────────────────────────────────────────────────
 
     def poll(self) -> list[Signal]:
         """
-        Fetch latest minute bars for all tickers.
-        Sleeps 12s between tickers to stay under Polygon free-tier 5 req/min limit.
-        Returns Signal objects when model direction changes above threshold.
+        Fetch new 1-min bars since last_ts for each ticker.
+        Closes new dollar bars, saves them to parquet, and returns any Signals.
         """
+        log.info("poll() called")
         all_events = []
         for ticker in self.tickers:
-            raw_bars = _fetch_latest_minute(ticker, n_bars=3)
-            for rb in raw_bars:
-                ts = rb["t"]   # epoch ms
-                if self.last_ts[ticker] and ts <= self.last_ts[ticker]:
-                    continue   # already processed
-                self.last_ts[ticker] = ts
-
-                row = {
-                    "timestamp": datetime.fromtimestamp(ts / 1000, tz=timezone.utc),
-                    "open":   rb["o"],
-                    "high":   rb["h"],
-                    "low":    rb["l"],
-                    "close":  rb["c"],
-                    "volume": rb["v"],
-                    "dollar": rb["c"] * rb["v"],
-                    "ticks":  rb.get("n", 1),
-                    "buy_dollar": 0.0, "sell_dollar": 0.0, "theta": 0.0,
-                }
-
-                new_bar = self.accumulators[ticker].add(row)
-                if new_bar is None:
+            try:
+                last_utc = (datetime.fromtimestamp(self.last_ts[ticker] / 1000, tz=timezone.utc)
+                            if self.last_ts[ticker] else None)
+                df = _fetch_yf(ticker, since_utc=last_utc)
+                if df.empty:
                     continue
-
-                self.histories[ticker].append(new_bar)
-
-                new_sigs = self._predict(ticker, new_bar)
-                all_events.extend(new_sigs)
-
+                new_bars = self._ingest_df(ticker, df)
+                if new_bars:
+                    self._save_bars(ticker, new_bars)
+                    log.info(f"{ticker}: poll — {len(new_bars)} new dollar bars, "
+                             f"latest close={new_bars[-1]['close']:.2f}")
+                    for bar in new_bars:
+                        all_events.extend(self._predict(ticker, bar))
+            except Exception as e:
+                log.warning(f"{ticker}: poll failed: {e}", exc_info=True)
         return all_events
 
     def _predict(self, ticker: str, bar: dict) -> list[Signal]:

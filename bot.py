@@ -37,8 +37,9 @@ last_status_sent = None
 open_positions: dict = {}
 
 _ET = ZoneInfo("America/New_York")
-MARKET_OPEN  = datetime.time(4, 0)   # 4:00 AM ET — pre-market start
-MARKET_CLOSE = datetime.time(20, 0)  # 8:00 PM ET — after-hours end
+MARKET_OPEN    = datetime.time(4, 0)   # 4:00 AM ET — pre-market start
+MARKET_CLOSE   = datetime.time(20, 0)  # 8:00 PM ET — after-hours end
+REGULAR_CLOSE  = datetime.time(16, 0)  # 4:00 PM ET — regular session close
 STATUS_INTERVAL_HOURS = 1
 
 
@@ -46,9 +47,16 @@ STATUS_INTERVAL_HOURS = 1
 
 def _in_window() -> bool:
     now_et = datetime.datetime.now(_ET)
-    if now_et.weekday() >= 5:          # 5=Saturday, 6=Sunday
+    if now_et.weekday() >= 5:
         return False
     return MARKET_OPEN <= now_et.time() <= MARKET_CLOSE
+
+def _in_regular_session() -> bool:
+    """True only during regular trading hours (9:30 AM – 4:00 PM ET, weekdays)."""
+    now_et = datetime.datetime.now(_ET)
+    if now_et.weekday() >= 5:
+        return False
+    return datetime.time(9, 30) <= now_et.time() <= REGULAR_CLOSE
 
 
 def _check_alarms() -> list[str]:
@@ -116,9 +124,9 @@ async def _send(content: str):
 
 # ── tasks ─────────────────────────────────────────────────────────────────────
 
-@tasks.loop(minutes=1)
+@tasks.loop(minutes=5)
 async def signal_loop():
-    if not _in_window():
+    if not _in_regular_session():
         return
 
     global last_status_sent
@@ -161,7 +169,7 @@ async def signal_loop():
 
 @tasks.loop(minutes=30)
 async def scan_loop():
-    if not _in_window():
+    if not _in_regular_session():
         return
     try:
         loop  = asyncio.get_event_loop()
@@ -183,7 +191,10 @@ async def on_ready():
 
     log.info("Loading signal engine ...")
     engine = SignalEngine()
-    log.info("Signal engine ready")
+    log.info("Signal engine ready — running warmup ...")
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, engine.warmup)
+    log.info("Warmup complete")
 
     if CHANNEL_ID:
         signal_loop.start()
@@ -205,6 +216,43 @@ async def on_message(message: discord.Message):
 @bot.command(name="ping")
 async def ping(ctx: commands.Context):
     await ctx.send(f"Pong! Latency: {round(bot.latency * 1000)}ms")
+
+
+@bot.command(name="debug")
+async def debug(ctx: commands.Context):
+    """Show engine internals: accumulator state, last_ts, history tail."""
+    if not engine:
+        await ctx.send("Engine not ready")
+        return
+
+    now = datetime.datetime.now(datetime.timezone.utc)
+    lines = [f"**── Engine Debug  {now.strftime('%H:%M:%S')} UTC ──**", ""]
+
+    for ticker in list(engine.tickers)[:3]:   # first 3 tickers to avoid message limit
+        acc      = engine.accumulators[ticker]
+        last_ts  = engine.last_ts.get(ticker)
+        hist_len = len(engine.histories[ticker])
+        hist_last = engine.histories[ticker][-1] if engine.histories[ticker] else None
+
+        ts_str  = (datetime.datetime.fromtimestamp(last_ts / 1000, tz=datetime.timezone.utc)
+                   .strftime("%H:%M:%S") if last_ts else "None")
+        bar_str = (datetime.datetime.utcfromtimestamp(
+                       hist_last["timestamp"].timestamp()
+                       if hasattr(hist_last["timestamp"], "timestamp")
+                       else hist_last["timestamp"] / 1000
+                   ).strftime("%m/%d %H:%M") if hist_last else "—")
+
+        lines += [
+            f"**{ticker}**",
+            f"  last_ts fetched : `{ts_str} UTC`",
+            f"  acc cum_dollar  : `${acc._cum_dollar:,.0f}`",
+            f"  acc threshold   : `${acc.threshold:,.0f}`",
+            f"  acc bucket bars : `{len(acc._bucket)}`",
+            f"  history bars    : `{hist_len}`  (latest {bar_str} UTC)",
+            "",
+        ]
+
+    await ctx.send("\n".join(lines))
 
 
 @bot.command(name="status")
