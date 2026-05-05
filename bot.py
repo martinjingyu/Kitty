@@ -183,20 +183,6 @@ async def signal_loop():
         last_status_sent = now
 
 
-@tasks.loop(minutes=30)
-async def scan_loop():
-    if not _in_regular_session():
-        return
-    try:
-        loop  = asyncio.get_event_loop()
-        scans = await loop.run_in_executor(None, engine.scan)
-    except Exception as e:
-        log.error(f"Scan error: {e}")
-        return
-    if scans:
-        await _send(format_predictions(scans, auto=True))
-
-
 # ── events ────────────────────────────────────────────────────────────────────
 
 @bot.event
@@ -214,9 +200,7 @@ async def on_ready():
 
     if CHANNEL_ID:
         signal_loop.start()
-        scan_loop.start()
         log.info(f"Signal loop started — polling every 1 min, window {MARKET_OPEN}–{MARKET_CLOSE} ET (weekdays only)")
-        log.info("Scan loop started — market snapshot every 30 min")
 
 
 @bot.event
