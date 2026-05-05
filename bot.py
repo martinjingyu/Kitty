@@ -12,7 +12,7 @@ from dotenv import load_dotenv
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from signals.engine    import SignalEngine, SIGNAL_CONFIG
+from signals.engine    import SignalEngine, SIGNAL_CONFIG, TARGET_RETURN_FLOOR
 from signals.formatter import (format_signal, format_status, format_predictions,
                                 format_open_confirm, format_close_confirm,
                                 format_sl_alarm, format_tp_alarm)
@@ -42,6 +42,8 @@ MARKET_OPEN    = datetime.time(4, 0)   # 4:00 AM ET — pre-market start
 MARKET_CLOSE   = datetime.time(20, 0)  # 8:00 PM ET — after-hours end
 REGULAR_CLOSE  = datetime.time(16, 0)  # 4:00 PM ET — regular session close
 STATUS_INTERVAL_HOURS = 1
+MAX_SIGNALS_PER_POLL = int(os.getenv("MAX_SIGNALS_PER_POLL", "3"))
+MAX_SCAN_ROWS = int(os.getenv("MAX_SCAN_ROWS", "5"))
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -155,9 +157,11 @@ async def signal_loop():
         log.error(f"Engine poll error: {e}")
         return
 
+    signals = sorted(signals, key=lambda s: s.confidence, reverse=True)[:MAX_SIGNALS_PER_POLL]
     for sig in signals:
         msg = format_signal(sig)
         await _send(msg)
+        engine.mark_signal_sent(sig)
         last_signal_time[sig.ticker] = datetime.datetime.now(datetime.timezone.utc)
         log.info(f"Signal: {sig.ticker} {sig.regime} {sig.direction} @ {sig.entry_price}")
 
@@ -311,7 +315,12 @@ async def cmd_open(ctx: commands.Context, ticker: str, regime: str,
             vol      = _rolling_vol(engine.histories[ticker], vol_lb)
             cfg      = engine.models.get(ticker, {}).get(regime, {})
             h_target = cfg.get("h_target", h)
-            target   = price * (1 + h_target * vol) if direction == "LONG" else price * (1 - h_target * vol)
+            target_floor = max(
+                TARGET_RETURN_FLOOR.get(regime, 0.0),
+                cfg.get("min_target_return", 0.0),
+            )
+            target_distance = max(h_target * vol, target_floor)
+            target   = price * (1 + target_distance) if direction == "LONG" else price * (1 - target_distance)
             target   = round(target, 2)
     except Exception:
         pass
@@ -424,6 +433,12 @@ async def cmd_signal(ctx: commands.Context, ticker: str = None):
     scans = await loop.run_in_executor(None, engine.scan)
     if ticker:
         scans = [s for s in scans if s.ticker == ticker.upper()]
+    else:
+        scans = sorted(
+            scans,
+            key=lambda s: (s.above_threshold, s.direction != "NEUTRAL", s.confidence),
+            reverse=True,
+        )[:MAX_SCAN_ROWS]
     if scans:
         await ctx.send(format_predictions(scans))
     else:

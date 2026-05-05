@@ -33,37 +33,35 @@ API_KEY  = os.getenv("POLYGON_API_KEY")
 BASE_URL = "https://api.polygon.io"
 
 # ── per-ticker signal config ──────────────────────────────────────────────────
-# (regime, threshold, h, vol_lookback, max_hold_bars)
-SIGNAL_CONFIG = {
-    # (regime, thr_long, thr_short, h, vol_lookback, max_hold_bars)
-    # intraday  thr=0.65: class-balanced model, precision ~72%
-    # weekly    thr=0.50: full coverage optimal, precision ~60%
-    # monthly   thr=0.54: 3-class model, precision ~53%, CONDOR → no signal
-    "SPY":  [("intraday", 0.65, 0.65, 0.5, 20,  20 ),
-             ("weekly",   0.50, 0.50, 1.5, 100, 100),
-             ("monthly",  0.54, 0.54, 1.5, 100, 400)],
-    "AAPL": [("intraday", 0.65, 0.65, 0.5, 20,  20 ),
-             ("weekly",   0.50, 0.50, 1.5, 100, 100),
-             ("monthly",  0.54, 0.54, 1.5, 100, 400)],
-    "NVDA": [("intraday", 0.65, 0.65, 0.5, 20,  20 ),
-             ("weekly",   0.50, 0.50, 1.5, 100, 100),
-             ("monthly",  0.54, 0.54, 1.5, 100, 400)],
-    "TSLA": [("intraday", 0.65, 0.65, 0.5, 20,  20 ),
-             ("weekly",   0.50, 0.50, 1.5, 100, 100),
-             ("monthly",  0.54, 0.54, 1.5, 100, 400)],
-    "SNDK": [("intraday", 0.65, 0.65, 0.5, 20,  20 ),
-             ("weekly",   0.50, 0.50, 1.5, 100, 100),
-             ("monthly",  0.54, 0.54, 1.5, 100, 400)],
-    "CRWV": [("intraday", 0.65, 0.65, 0.5, 20,  20 ),
-             ("weekly",   0.50, 0.50, 1.5, 100, 100),
-             ("monthly",  0.54, 0.54, 1.5, 100, 400)],
-}
+DEFAULT_TICKERS = [
+    "AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "META",
+    "TSLA", "WMT", "MS", "JPM", "BE", "PLTR",
+    "SPY", "IBM", "IWM", "MU", "SNDK", "CRWV",
+    "NBIS", "INTC", "AMD", "ORCL", "COIN", "MSTR",
+]
+
+# (regime, thr_long, thr_short, h, vol_lookback, max_hold_bars)
+# intraday  thr=0.65: class-balanced model, precision ~72%
+# weekly    thr=0.50: full coverage optimal, precision ~60%
+# monthly   thr=0.54: 3-class model, precision ~53%, CONDOR → no signal
+DEFAULT_REGIME_CONFIG = [
+    ("intraday", 0.65, 0.65, 0.5, 20,  20),
+    ("weekly",   0.50, 0.50, 1.5, 100, 100),
+    ("monthly",  0.54, 0.54, 1.5, 100, 400),
+]
+
+SIGNAL_CONFIG = {ticker: list(DEFAULT_REGIME_CONFIG) for ticker in DEFAULT_TICKERS}
 
 MODEL_DIR = Path("models/saved")
 BARS_DIR  = Path("data/bars/processed")
 HISTORY_LEN = 500   # dollar bars to keep in memory for feature computation
 BAR_TYPES = ("volume", "dollar", "runs", "imbalance")
 BARS_PER_DAY = 20
+TARGET_RETURN_FLOOR = {
+    "intraday": 0.01,
+    "weekly":   0.05,
+    "monthly":  0.10,
+}
 
 
 # ── data classes ─────────────────────────────────────────────────────────────
@@ -577,23 +575,29 @@ class SignalEngine:
             vol      = _rolling_vol(self.histories[ticker], cfg["vol_lb"])
             h_target = cfg.get("h_target", cfg.get("h", 1.0))
             h_stop   = cfg.get("h_stop",   cfg.get("h", 1.0))
+            target_floor = max(
+                TARGET_RETURN_FLOOR.get(regime, 0.0),
+                cfg.get("min_target_return", 0.0),
+            )
+            target_distance = max(h_target * vol, target_floor)
+            stop_distance   = h_stop * vol
 
             if direction == "LONG":
-                target = entry * (1 + h_target * vol)
-                stop   = entry * (1 - h_stop   * vol)
+                target = entry * (1 + target_distance)
+                stop   = entry * (1 - stop_distance)
             else:
-                target = entry * (1 - h_target * vol)
-                stop   = entry * (1 + h_stop   * vol)
+                target = entry * (1 - target_distance)
+                stop   = entry * (1 + stop_distance)
 
-            target_pct = (target / entry - 1) * 100
-            stop_pct   = (stop   / entry - 1) * 100
+            target_pct = target_distance * 100
+            stop_pct   = -stop_distance * 100
             days = int(cfg["max_hold"] / 20)  # 20 dollar bars ≈ 1 trading day
 
-            # Only emit a signal when the recommended direction changes
+            # Only consider a signal when the recommended direction changes.
+            # The bot marks it as sent after it survives top-N filtering.
             sig_key = f"{ticker}_{regime}"
             if self.last_signal_dir.get(sig_key) == direction:
                 continue
-            self.last_signal_dir[sig_key] = direction
 
             results.append(Signal(
                 ticker=ticker,
@@ -610,6 +614,10 @@ class SignalEngine:
             ))
 
         return results
+
+    def mark_signal_sent(self, sig: Signal):
+        """Record the last direction only for signals actually sent to Discord."""
+        self.last_signal_dir[f"{sig.ticker}_{sig.regime}"] = sig.direction
 
     def get_proba(self, ticker: str, regime: str) -> tuple[float, float, float] | None:
         """

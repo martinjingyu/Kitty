@@ -57,13 +57,22 @@ def _make_record(t, t_exit, ts, close, vol_t, label):
 def label_intraday(
     bars: pd.DataFrame,
     h: float = 0.5,
+    h_up: float | None = None,
+    h_down: float | None = None,
     max_hold: int = 20,
     vol_lookback: int = 20,
     stride: int = 1,
+    min_target_return: float = 0.0,
+    min_up_return: float | None = None,
+    min_down_return: float | None = None,
 ) -> pd.DataFrame:
     """
     Classic triple-barrier, exit on first barrier touch.
     Labels: +1 (LONG) / -1 (SHORT) / 0 (organic vertical — very rare, dropped later)
+
+    By default the upper/lower barriers are symmetric:
+        max(h * vol, min_target_return)
+    Pass h_up/h_down and min_up_return/min_down_return for asymmetric barriers.
     """
     close = bars["close"].values
     high  = bars["high"].values
@@ -79,9 +88,15 @@ def label_intraday(
         if np.isnan(vol_t) or vol_t == 0:
             continue
 
-        entry   = close[t]
-        upper   = entry * (1 + h * vol_t)
-        lower   = entry * (1 - h * vol_t)
+        entry     = close[t]
+        up_mult   = h if h_up is None else h_up
+        down_mult = h if h_down is None else h_down
+        min_up    = min_target_return if min_up_return is None else min_up_return
+        min_down  = min_target_return if min_down_return is None else min_down_return
+        up_dist   = max(up_mult * vol_t, min_up)
+        down_dist = max(down_mult * vol_t, min_down)
+        upper     = entry * (1 + up_dist)
+        lower     = entry * (1 - down_dist)
         horizon = min(t + max_hold, n - 1)
 
         label  = 0
@@ -115,6 +130,7 @@ def label_weekly_reversal(
     entry_threshold: float = 1.0, # |vol-adj momentum| to trigger dip/top sampling
     condor_threshold: float = 0.3,# |vol-adj momentum| below which condor is sampled
     condor_area_thr: float = 0.3, # max |area_norm| to keep as CONDOR
+    min_target_return: float = 0.0,
 ) -> pd.DataFrame:
     """
     Asymmetric barrier labeling for weekly reversals.
@@ -165,14 +181,16 @@ def label_weekly_reversal(
 
         # ── directional candidate ─────────────────────────────────────────────
         if mom_std < -entry_threshold:
-            h_up, h_down = h_target, h_stop   # dip buy: wide profit, tight stop
+            up_dist = max(h_target * vol_t, min_target_return)
+            down_dist = h_stop * vol_t
         elif mom_std > entry_threshold:
-            h_up, h_down = h_stop, h_target   # top sell: tight stop, wide profit
+            up_dist = h_stop * vol_t
+            down_dist = max(h_target * vol_t, min_target_return)
         else:
             continue  # intermediate zone — skip
 
-        upper = entry * (1 + h_up   * vol_t)
-        lower = entry * (1 - h_down * vol_t)
+        upper = entry * (1 + up_dist)
+        lower = entry * (1 - down_dist)
 
         label  = 0
         t_exit = horizon
@@ -205,6 +223,7 @@ def label_monthly_area(
     long_thr: float   =  5.0,  # area_norm > long_thr  → LONG  (absolute, regime-agnostic)
     short_thr: float  = -5.0,  # area_norm < short_thr → SHORT
     condor_thr: float =  2.0,  # |area_norm| < condor_thr → CONDOR
+    min_target_return: float = 0.0,
 ) -> pd.DataFrame:
     """
     Monthly labeling via cumulative price-area integral with FIXED thresholds.
@@ -217,6 +236,8 @@ def label_monthly_area(
         -1 (SHORT) : area_norm ≤ short_thr — price consistently below entry
          0 (CONDOR): |area_norm| ≤ condor_thr — price oscillated near entry
         skip       : intermediate zone (ambiguous, not sampled)
+        Directional labels also require the favorable path to reach
+        min_target_return at least once during the holding window.
 
     This ensures SHORT always means area is truly negative, regardless of
     whether the overall market is in a bull or bear regime.
@@ -241,9 +262,12 @@ def label_monthly_area(
         denom     = vol_t * max_hold
         area_norm = area / denom if denom > 0 else 0.0
 
-        if area_norm >= long_thr:
+        max_up = float(future.max() / entry - 1)
+        max_down = float(1 - future.min() / entry)
+
+        if area_norm >= long_thr and max_up >= min_target_return:
             label = 1
-        elif area_norm <= short_thr:
+        elif area_norm <= short_thr and max_down >= min_target_return:
             label = -1
         elif abs(area_norm) <= condor_thr:
             label = 0
@@ -280,4 +304,5 @@ def label_monthly_area(
 def label_triple_barrier(bars, h=1.0, max_hold=100, vol_lookback=20,
                          stride=1, neutral_frac=0.0, **_):
     return label_intraday(bars, h=h, max_hold=max_hold,
-                          vol_lookback=vol_lookback, stride=stride)
+                          vol_lookback=vol_lookback, stride=stride,
+                          min_target_return=_.get("min_target_return", 0.0))

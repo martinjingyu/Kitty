@@ -4,3 +4,4 @@ __pycache__/
 models/saved
 data/dataset
 data/bars
+data/raw/

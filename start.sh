@@ -25,6 +25,7 @@ fi
 # ── helpers ───────────────────────────────────────────────────────────────────
 MODE="${1:-bot}"
 shift || true   # remaining args are optional ticker list
+DEFAULT_TICKERS="AAPL MSFT NVDA GOOGL AMZN META TSLA WMT MS JPM BE PLTR SPY IBM IWM MU SNDK CRWV NBIS INTC AMD ORCL COIN MSTR"
 
 log() { echo "[$(date '+%H:%M:%S')] $*"; }
 
@@ -42,7 +43,7 @@ case "$MODE" in
     ;;
 
   pipeline)
-    TICKERS="${*:-SPY SNDK CRWV}"
+    TICKERS="${*:-$DEFAULT_TICKERS}"
     log "Running pipeline for: $TICKERS"
     python3 scripts/run_pipeline.py --tickers $TICKERS
     log "Pipeline complete. Start the bot with: bash start.sh bot"
@@ -52,7 +53,7 @@ case "$MODE" in
     echo "Usage: bash start.sh [bot|pipeline] [TICKER ...]"
     echo ""
     echo "  bot                  Start the Discord bot (default)"
-    echo "  pipeline             Fetch data + train models for SPY SNDK CRWV"
+    echo "  pipeline             Fetch data + train models for the default ticker basket"
     echo "  pipeline SPY SNDK    Fetch data + train models for specific tickers"
     exit 1
     ;;

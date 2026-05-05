@@ -29,6 +29,7 @@ OUT_DIR   = Path("data/dataset")
 MODEL_DIR = Path("models/saved")
 OUT_DIR.mkdir(exist_ok=True)
 MODEL_DIR.mkdir(exist_ok=True)
+INTRADAY_BOUNDARY_PATH = MODEL_DIR / "intraday_boundary_sweep_top.csv"
 
 TRAIN_RATIO = 0.7
 THRESHOLDS_BINARY = [0.50, 0.52, 0.54, 0.56, 0.58, 0.60, 0.63, 0.65]
@@ -40,6 +41,12 @@ META_COLS = {"t", "t_exit", "timestamp", "timestamp_exit",
 
 # absolute-scale features that differ by ticker and must be z-scored per ticker
 ABS_FEATURES = ["d_log_volume", "d_log_dollar"]
+DEFAULT_TICKERS = [
+    "AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "META",
+    "TSLA", "WMT", "MS", "JPM", "BE", "PLTR",
+    "SPY", "IBM", "IWM", "MU", "SNDK", "CRWV",
+    "NBIS", "INTC", "AMD", "ORCL", "COIN", "MSTR",
+]
 
 CONFIGS = {
     "intraday": {
@@ -48,6 +55,7 @@ CONFIGS = {
         "max_hold":         20,
         "stride":           1,
         "h":                0.5,
+        "min_target_return": 0.01,
         "vol_lookback":     20,
         "feat_windows":     [20, 50, 100, 400],
         "density_win_min":  60,
@@ -62,6 +70,7 @@ CONFIGS = {
         "stride":            2,
         "h_target":          1.5,   # profit barrier (wide side)
         "h_stop":            0.75,  # stop barrier   (tight side)
+        "min_target_return": 0.05,
         "vol_lookback":      100,
         "mom_window":        20,
         "entry_threshold":   1.0,
@@ -81,6 +90,7 @@ CONFIGS = {
         "long_thr":          5.0,   # area_norm > +5 → LONG
         "short_thr":        -5.0,   # area_norm < -5 → SHORT
         "condor_thr":        2.0,   # |area_norm| < 2 → CONDOR
+        "min_target_return": 0.10,
         "feat_windows":      [100, 200, 400],
         "density_win_min":   1950,
         "prefix":            "d_",
@@ -110,6 +120,70 @@ def _assign_seq_indices(dataset: pd.DataFrame, timestamp_exit_col: str = "timest
     out["t_seq"]      = t_seq
     out["t_exit_seq"] = t_exit_seq
     return out
+
+
+def load_intraday_boundaries(path: str | Path | None) -> dict[str, dict]:
+    """
+    Load per-ticker asymmetric intraday barriers from a sweep top CSV.
+
+    Expected columns come from scripts/sweep_intraday_boundaries.py:
+    ticker,h_up,h_down,min_up_%,min_down_%.
+    The first row per ticker is used, so pass the *_top.csv output sorted by
+    score descending.
+    """
+    if path is None:
+        return {}
+    path = Path(path)
+    if not path.exists():
+        print(f"  Intraday boundary file not found: {path} — using default config")
+        return {}
+
+    df = pd.read_csv(path)
+    required = {"ticker", "h_up", "h_down", "min_up_%", "min_down_%"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"{path} missing columns: {sorted(missing)}")
+
+    boundaries = {}
+    for _, row in df.drop_duplicates("ticker", keep="first").iterrows():
+        ticker = str(row["ticker"]).upper()
+        boundaries[ticker] = {
+            "h_up": float(row["h_up"]),
+            "h_down": float(row["h_down"]),
+            "min_up_return": float(row["min_up_%"]) / 100,
+            "min_down_return": float(row["min_down_%"]) / 100,
+        }
+    print(f"  Loaded intraday boundary overrides for {len(boundaries)} ticker(s) from {path}")
+    return boundaries
+
+
+def _intraday_boundary_for_ticker(cfg: dict, ticker: str) -> dict:
+    overrides = cfg.get("boundary_overrides", {})
+    override = overrides.get(ticker.upper(), {})
+    return {
+        "h_up": override.get("h_up", cfg.get("h_up", cfg["h"])),
+        "h_down": override.get("h_down", cfg.get("h_down", cfg["h"])),
+        "min_up_return": override.get(
+            "min_up_return",
+            cfg.get("min_up_return", cfg["min_target_return"]),
+        ),
+        "min_down_return": override.get(
+            "min_down_return",
+            cfg.get("min_down_return", cfg["min_target_return"]),
+        ),
+    }
+
+
+def select_regime_configs(regimes: list[str] | None = None) -> dict[str, dict]:
+    """Return copied configs for requested regimes, preserving CONFIGS order."""
+    if not regimes:
+        requested = list(CONFIGS.keys())
+    else:
+        requested = [r.lower() for r in regimes]
+    unknown = sorted(set(requested) - set(CONFIGS.keys()))
+    if unknown:
+        raise ValueError(f"Unknown regime(s): {unknown}. Valid: {list(CONFIGS.keys())}")
+    return {name: CONFIGS[name].copy() for name in CONFIGS if name in requested}
 
 
 def sharpe(returns: pd.Series, stride: int = 20) -> float:
@@ -220,7 +294,10 @@ def _make_xgb(n_samples: int, n_classes: int) -> XGBClassifier:
 # ── main ──────────────────────────────────────────────────────────────────────
 
 def run_regime(regime: str, cfg: dict, all_bars: dict, tickers: list):
-    h_str = f"h={cfg['h']}" if 'h' in cfg else f"h_target={cfg.get('h_target','?')}"
+    if regime == "intraday":
+        h_str = "asymmetric" if cfg.get("boundary_overrides") else f"h={cfg['h']}"
+    else:
+        h_str = f"h={cfg['h']}" if 'h' in cfg else f"h_target={cfg.get('h_target','?')}"
     print(f"\n{'█'*60}")
     print(f"  REGIME: {regime.upper()}  (max_hold={cfg['max_hold']} bars, {h_str})")
     print(f"  Tickers: {', '.join(tickers)}")
@@ -235,11 +312,19 @@ def run_regime(regime: str, cfg: dict, all_bars: dict, tickers: list):
         dollar = all_bars[ticker]["dollar"]
 
         label_fn = cfg["label_fn"]
+        boundary = None
         if label_fn == "intraday":
+            boundary = _intraday_boundary_for_ticker(cfg, ticker)
             labels = label_intraday(
                 dollar,
-                h=cfg["h"], max_hold=cfg["max_hold"],
+                h=cfg["h"],
+                h_up=boundary["h_up"],
+                h_down=boundary["h_down"],
+                max_hold=cfg["max_hold"],
                 vol_lookback=cfg["vol_lookback"], stride=cfg["stride"],
+                min_target_return=cfg["min_target_return"],
+                min_up_return=boundary["min_up_return"],
+                min_down_return=boundary["min_down_return"],
             )
         elif label_fn == "weekly":
             labels = label_weekly_reversal(
@@ -250,6 +335,7 @@ def run_regime(regime: str, cfg: dict, all_bars: dict, tickers: list):
                 entry_threshold=cfg["entry_threshold"],
                 condor_threshold=cfg["condor_threshold"],
                 condor_area_thr=cfg["condor_area_thr"],
+                min_target_return=cfg["min_target_return"],
             )
         elif label_fn == "monthly":
             labels = label_monthly_area(
@@ -257,13 +343,21 @@ def run_regime(regime: str, cfg: dict, all_bars: dict, tickers: list):
                 max_hold=cfg["max_hold"], vol_lookback=cfg["vol_lookback"],
                 stride=cfg["stride"], long_thr=cfg["long_thr"],
                 short_thr=cfg["short_thr"], condor_thr=cfg["condor_thr"],
+                min_target_return=cfg["min_target_return"],
             )
         else:
             raise ValueError(f"Unknown label_fn: {label_fn}")
 
         dist = labels["label"].value_counts().sort_index()
+        boundary_str = ""
+        if boundary:
+            boundary_str = (
+                f" | up: h={boundary['h_up']:.2f}, min={boundary['min_up_return']:.2%}"
+                f"  down: h={boundary['h_down']:.2f}, min={boundary['min_down_return']:.2%}"
+            )
         print(f"  {ticker}: {len(labels):,} events  "
-              f"| -1: {dist.get(-1,0):,}  0: {dist.get(0,0):,}  +1: {dist.get(1,0):,}")
+              f"| -1: {dist.get(-1,0):,}  0: {dist.get(0,0):,}  +1: {dist.get(1,0):,}"
+              f"{boundary_str}")
 
         feats = build_features(
             dollar=dollar,
@@ -393,10 +487,21 @@ def run_regime(regime: str, cfg: dict, all_bars: dict, tickers: list):
 def main():
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument("--tickers", nargs="+", default=["SPY"],
+    parser.add_argument("--tickers", nargs="+", default=DEFAULT_TICKERS,
                         help="One or more tickers to train on together")
+    parser.add_argument("--intraday-boundaries", default=str(INTRADAY_BOUNDARY_PATH),
+                        help="CSV from sweep_intraday_boundaries.py; use 'none' to disable")
+    parser.add_argument("--regimes", nargs="+", choices=list(CONFIGS.keys()),
+                        default=list(CONFIGS.keys()),
+                        help="Regimes to train; default trains all")
     args    = parser.parse_args()
     tickers = [t.upper() for t in args.tickers]
+
+    boundary_path = None if args.intraday_boundaries.lower() == "none" else args.intraday_boundaries
+    configs = select_regime_configs(args.regimes)
+    if "intraday" in configs:
+        configs["intraday"]["boundary_overrides"] = load_intraday_boundaries(boundary_path)
+    print(f"Training regimes: {', '.join(configs.keys())}")
 
     print(f"Loading bars for: {', '.join(tickers)} ...")
     all_bars = {}
@@ -410,7 +515,7 @@ def main():
         for k, v in all_bars[ticker].items():
             print(f"  {ticker} {k}: {len(v):,} bars")
 
-    for regime, cfg in CONFIGS.items():
+    for regime, cfg in configs.items():
         run_regime(regime, cfg, all_bars, tickers)
 
     print(f"\n{'═'*60}")

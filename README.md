@@ -150,16 +150,84 @@ POLYGON_API_KEY=your_polygon_api_key
 ```bash
 bash start.sh pipeline
 # or
-python3 scripts/run_pipeline.py --tickers SPY AAPL CRWV NVDA SNDK TSLA
+python3 scripts/run_pipeline.py
 ```
 
 After updating bar-construction logic, use `--force` to rebuild from raw data:
 
 ```bash
-python3 scripts/run_pipeline.py --tickers SPY AAPL CRWV NVDA SNDK TSLA --force
+python3 scripts/run_pipeline.py --force
 ```
 
-### 4. Start the bot
+Train only selected regimes:
+
+```bash
+python3 scripts/run_pipeline.py --regimes intraday
+python3 scripts/run_pipeline.py --tickers SPY AAPL NVDA --regimes intraday
+python3 scripts/build_and_train.py --tickers SPY AAPL NVDA --regimes intraday weekly
+```
+
+### 4. Tune intraday boundaries
+
+Before retraining intraday models, sweep asymmetric upside / downside
+barriers per ticker:
+
+```bash
+python3 scripts/sweep_intraday_boundaries.py
+```
+
+Useful custom run:
+
+```bash
+python3 scripts/sweep_intraday_boundaries.py \
+  --tickers SPY AAPL NVDA TSLA \
+  --h-up 0.6,0.8,1.0,1.2 \
+  --h-down 0.6,0.8,1.0,1.2 \
+  --min-up 0.01,0.0125,0.015,0.02 \
+  --min-down 0.008,0.01,0.0125,0.015 \
+  --min-balance 0.55 \
+  --max-short-share 0.65 \
+  --top-n 5
+```
+
+Outputs:
+
+```text
+models/saved/intraday_boundary_sweep.csv
+models/saved/intraday_boundary_sweep_top.csv
+```
+
+The sweep does **not** train a model. It labels historical dollar bars with:
+
+```python
+up_dist = max(h_up * vol, min_up)
+down_dist = max(h_down * vol, min_down)
+```
+
+Then ranks settings by directional coverage, LONG/SHORT balance, sample count,
+and target/stop ratio. Use this to pick ticker-specific intraday boundary
+settings before editing the training config.
+
+Training reads the top sweep output automatically when the file exists:
+
+```text
+models/saved/intraday_boundary_sweep_top.csv
+```
+
+To train with a different sweep result:
+
+```bash
+python3 scripts/build_and_train.py \
+  --intraday-boundaries models/saved/my_intraday_boundary_top.csv
+```
+
+To ignore per-ticker intraday boundaries and use the symmetric default:
+
+```bash
+python3 scripts/build_and_train.py --intraday-boundaries none
+```
+
+### 5. Start the bot
 
 ```bash
 bash start.sh bot
@@ -242,7 +310,9 @@ Kitty/
 ├── scripts/
 │   ├── run_pipeline.py         # End-to-end: fetch → bars → train  [--force]
 │   ├── build_bars.py           # Bar construction only              [--force]
-│   └── build_and_train.py      # Feature engineering + model training
+│   ├── build_and_train.py      # Feature engineering + model training
+│   └── sweep_intraday_boundaries.py
+│                               # Per-ticker intraday boundary sweep
 │
 ├── signals/
 │   ├── engine.py               # Dollar bar accumulator · signal generation
@@ -263,8 +333,26 @@ Kitty/
 
 | Label | Trigger |
 |-------|---------|
-| **+1 LONG**  | Price hits `entry × (1 + h × vol)` first |
-| **−1 SHORT** | Price hits `entry × (1 − h × vol)` first |
+| **+1 LONG**  | Price hits upper barrier first |
+| **−1 SHORT** | Price hits lower barrier first |
+
+Current training uses a symmetric barrier:
+
+```python
+barrier = max(h * vol, min_target_return)
+upper = entry * (1 + barrier)
+lower = entry * (1 - barrier)
+```
+
+If `models/saved/intraday_boundary_sweep_top.csv` exists, training reads the
+first row per ticker and switches intraday labels to asymmetric barriers:
+
+```python
+up_dist = max(h_up * vol, min_up)
+down_dist = max(h_down * vol, min_down)
+upper = entry * (1 + up_dist)
+lower = entry * (1 - down_dist)
+```
 
 **Weekly** — asymmetric momentum-filtered barriers (binary):
 
@@ -313,4 +401,4 @@ area_norm = area / (vol × max_hold)
 
 - Polygon.io free tier has ~15-minute data delay.
 - Monthly CONDOR signals are shown in scans but not forwarded as position alerts — they require a different position structure (iron condor).
-- Retrain periodically: `python3 scripts/run_pipeline.py --tickers SPY AAPL CRWV NVDA SNDK TSLA --force`
+- Retrain periodically: `python3 scripts/run_pipeline.py --tickers AAPL MSFT NVDA GOOGL AMZN META TSLA WMT MS JPM BE PLTR SPY IBM IWM MU SNDK CRWV NBIS INTC AMD ORCL COIN MSTR --force`
