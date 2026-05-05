@@ -1,16 +1,29 @@
 """Discord message formatting for trading signals and status updates."""
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 from signals.engine import Signal, ProbaScan
 
 REGIME_LABEL = {"intraday": "日内", "weekly": "1 周", "monthly": "1 个月"}
 REGIME_TYPE  = {"intraday": "日内方向", "weekly": "反转信号", "monthly": "月度趋势"}
+CENTRAL_TZ = ZoneInfo("America/Chicago")
+
+
+def _central(dt: datetime) -> datetime:
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(CENTRAL_TZ)
+
+
+def _fmt_central(dt: datetime, fmt: str = "%Y-%m-%d %H:%M %Z") -> str:
+    return _central(dt).strftime(fmt)
 
 
 def format_signal(sig: Signal) -> str:
     direction_icon = "📈" if sig.direction == "LONG" else "📉"
     regime_label   = REGIME_LABEL.get(sig.regime, sig.regime)
     regime_type    = REGIME_TYPE.get(sig.regime, sig.regime)
-    exit_date      = (datetime.now(timezone.utc) + timedelta(days=max(sig.timeframe_days, 1)))
+    now_ct         = datetime.now(timezone.utc).astimezone(CENTRAL_TZ)
+    exit_date      = now_ct + timedelta(days=max(sig.timeframe_days, 1))
     exit_str       = exit_date.strftime("%m/%d")
 
     target_sign = "+" if sig.target_pct > 0 else ""
@@ -31,7 +44,7 @@ def format_signal(sig: Signal) -> str:
         f"**持仓周期**  {regime_label}  · 建议 {exit_str} 前平仓",
         f"**置信度**    `{sig.confidence:.1f}%`",
         "",
-        f"-# {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC  ·  数据延迟约 15 分钟",
+        f"-# {now_ct.strftime('%Y-%m-%d %H:%M %Z')}  ·  数据延迟约 15 分钟",
     ]
     return "\n".join(lines)
 
@@ -41,7 +54,7 @@ def format_open_confirm(ticker: str, regime: str, direction: str,
                         target: float | None = None) -> str:
     icon         = "📈" if direction == "LONG" else "📉"
     regime_label = REGIME_LABEL.get(regime, regime)
-    time_str     = trade_time.strftime("%Y-%m-%d %H:%M")
+    time_str     = _fmt_central(trade_time)
     target_line  = f"**止盈目标**  `${target:,.2f}`" if target else "**止盈目标**  —"
     lines = [
         f"{icon} **{ticker}  开仓记录  [{regime_label}]**",
@@ -49,7 +62,7 @@ def format_open_confirm(ticker: str, regime: str, direction: str,
         f"**方向**     `{direction}`",
         f"**入场价**   `${price:,.2f}`",
         target_line,
-        f"**时间**     `{time_str} UTC`",
+        f"**时间**     `{time_str}`",
         "",
         f"-# `!close {ticker} {regime} <出场价> [50%] [HH:MM]` 全仓或部分平仓",
     ]
@@ -76,8 +89,8 @@ def format_close_confirm(ticker: str, regime: str, direction: str,
         f"{icon} **{ticker}  平仓记录  [{regime_label}]**",
         "",
         f"**方向**     `{direction}`",
-        f"**入场价**   `${entry_price:,.2f}`  @ `{entry_time.strftime('%m/%d %H:%M')} UTC`",
-        f"**出场价**   `${exit_price:,.2f}`  @ `{exit_time.strftime('%m/%d %H:%M')} UTC`",
+        f"**入场价**   `${entry_price:,.2f}`  @ `{_fmt_central(entry_time, '%m/%d %H:%M %Z')}`",
+        f"**出场价**   `${exit_price:,.2f}`  @ `{_fmt_central(exit_time, '%m/%d %H:%M %Z')}`",
         f"**盈亏**     `{pnl_sign}{pnl_pct:.2f}%`  ·  {partial_note}",
         f"**持仓时长** `{held_str}`",
     ]
@@ -138,43 +151,54 @@ def format_tp_alarm(pos: dict, current_price: float,
     return "\n".join(lines)
 
 
-def format_scan(scans: list[ProbaScan]) -> str:
-    now = datetime.now(timezone.utc)
-    lines = [f"**── 市场扫描  {now.strftime('%m/%d %H:%M')} UTC ──**", ""]
+def format_predictions(scans: list[ProbaScan], auto: bool = False) -> str:
+    """
+    Compact prediction table for all tickers.
+    🟢/🔴 = above signal threshold (actionable)
+    📈/📉 = below threshold (reference only)
+    🦅    = CONDOR candidate (monthly)
+    """
+    now    = datetime.now(timezone.utc)
+    now_ct = now.astimezone(CENTRAL_TZ)
 
-    # group by ticker
-    by_ticker: dict[str, list[ProbaScan]] = {}
+    by_ticker: dict[str, dict[str, ProbaScan]] = {}
     for s in scans:
-        by_ticker.setdefault(s.ticker, []).append(s)
+        by_ticker.setdefault(s.ticker, {})[s.regime] = s
 
-    dir_icon = {"LONG": "📈", "SHORT": "📉", "NEUTRAL": "⬜", "CONDOR": "🦅"}
+    REGIME_ORDER = ["intraday", "weekly", "monthly"]
+    REGIME_SHORT = {"intraday": "日内", "weekly": "周线", "monthly": "月线"}
 
-    for ticker, rows in by_ticker.items():
-        price_str = f"${rows[0].price:,.2f}"
-        lines.append(f"**{ticker}**  `{price_str}`")
-        for s in rows:
-            regime_cn = REGIME_LABEL.get(s.regime, s.regime)
-            # monthly 3-class: NEUTRAL means CONDOR (iron condor candidate)
-            display_dir = "CONDOR" if s.direction == "NEUTRAL" and s.regime == "monthly" else s.direction
-            icon        = dir_icon.get(display_dir, "⬜")
-            conf_str    = f"{s.confidence:.1%}"
-            if s.proba_neutral > 0:
-                detail = (f"多 {s.proba_long:.1%}  空 {s.proba_short:.1%}"
-                          f"  condor {s.proba_neutral:.1%}")
+    suffix = "  `-# 每 30 分钟自动更新`" if auto else ""
+    lines  = [f"📊 **市场预测**  `{now_ct.strftime('%H:%M %Z  %m/%d')}`{suffix}", ""]
+
+    for ticker, by_regime in by_ticker.items():
+        price = next(iter(by_regime.values())).price
+        parts = []
+        for regime in REGIME_ORDER:
+            s = by_regime.get(regime)
+            if s is None:
+                continue
+            label     = REGIME_SHORT[regime]
+            is_condor = (s.direction == "NEUTRAL" and regime == "monthly")
+            if is_condor:
+                icon = "🦅"
+                conf = f"{s.proba_neutral:.0%}"
+            elif s.above_threshold:
+                icon = "🟢" if s.direction == "LONG" else "🔴"
+                conf = f"{s.confidence:.0%}"
             else:
-                detail = f"多 {s.proba_long:.1%}  空 {s.proba_short:.1%}"
-            lines.append(
-                f"  {regime_cn:<5} {icon} **{display_dir:<7}** `{conf_str}`"
-                f"  ·  {detail}"
-            )
-        lines.append("")
+                icon = "📈" if s.direction == "LONG" else "📉"
+                conf = f"{s.confidence:.0%}"
+            parts.append(f"{label} {icon}`{conf}`")
 
-    lines.append(f"-# 每 30 分钟更新  ·  数据延迟约 15 分钟")
+        lines.append(f"**{ticker}** `${price:,.2f}`  {'  ·  '.join(parts)}")
+
+    lines += ["", "-# 🟢🔴 已触发阈值  ·  📈📉 未超阈值  ·  🦅 震荡候选"]
     return "\n".join(lines)
 
 
 def format_status(last_signals: dict[str, datetime], tickers: list[str]) -> str:
-    now   = datetime.now(timezone.utc)
+    now   = datetime.now(timezone.utc).astimezone(CENTRAL_TZ)
     lines = ["**── 信号监控状态 ──**", ""]
     for ticker in tickers:
         last = last_signals.get(ticker)
@@ -187,5 +211,5 @@ def format_status(last_signals: dict[str, datetime], tickers: list[str]) -> str:
         else:
             lines.append(f"`{ticker}`  暂无信号")
     lines.append("")
-    lines.append(f"-# 过去 1 小时内无新信号  ·  {now.strftime('%H:%M')} UTC")
+    lines.append(f"-# 过去 1 小时内无新信号  ·  {now.strftime('%H:%M %Z')}")
     return "\n".join(lines)

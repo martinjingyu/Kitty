@@ -13,7 +13,7 @@ from dotenv import load_dotenv
 sys.path.insert(0, str(Path(__file__).parent))
 
 from signals.engine    import SignalEngine, SIGNAL_CONFIG
-from signals.formatter import (format_signal, format_status, format_scan,
+from signals.formatter import (format_signal, format_status, format_predictions,
                                 format_open_confirm, format_close_confirm,
                                 format_sl_alarm, format_tp_alarm)
 
@@ -37,6 +37,7 @@ last_status_sent = None
 open_positions: dict = {}
 
 _ET = ZoneInfo("America/New_York")
+_CT = ZoneInfo("America/Chicago")
 MARKET_OPEN    = datetime.time(4, 0)   # 4:00 AM ET — pre-market start
 MARKET_CLOSE   = datetime.time(20, 0)  # 8:00 PM ET — after-hours end
 REGULAR_CLOSE  = datetime.time(16, 0)  # 4:00 PM ET — regular session close
@@ -57,6 +58,21 @@ def _in_regular_session() -> bool:
     if now_et.weekday() >= 5:
         return False
     return datetime.time(9, 30) <= now_et.time() <= REGULAR_CLOSE
+
+
+def _parse_central_time(time_str: str | None) -> datetime.datetime:
+    now_ct = datetime.datetime.now(_CT)
+    if not time_str:
+        return now_ct.astimezone(datetime.timezone.utc)
+    h, m = map(int, time_str.split(":"))
+    trade_ct = now_ct.replace(hour=h, minute=m, second=0, microsecond=0)
+    return trade_ct.astimezone(datetime.timezone.utc)
+
+
+def _fmt_central(dt: datetime.datetime, fmt: str = "%H:%M:%S %Z") -> str:
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=datetime.timezone.utc)
+    return dt.astimezone(_CT).strftime(fmt)
 
 
 def _check_alarms() -> list[str]:
@@ -178,7 +194,7 @@ async def scan_loop():
         log.error(f"Scan error: {e}")
         return
     if scans:
-        await _send(format_scan(scans))
+        await _send(format_predictions(scans, auto=True))
 
 
 # ── events ────────────────────────────────────────────────────────────────────
@@ -226,7 +242,7 @@ async def debug(ctx: commands.Context):
         return
 
     now = datetime.datetime.now(datetime.timezone.utc)
-    lines = [f"**── Engine Debug  {now.strftime('%H:%M:%S')} UTC ──**", ""]
+    lines = [f"**── Engine Debug  {_fmt_central(now)} ──**", ""]
 
     for ticker in list(engine.tickers)[:3]:   # first 3 tickers to avoid message limit
         acc      = engine.accumulators[ticker]
@@ -234,21 +250,26 @@ async def debug(ctx: commands.Context):
         hist_len = len(engine.histories[ticker])
         hist_last = engine.histories[ticker][-1] if engine.histories[ticker] else None
 
-        ts_str  = (datetime.datetime.fromtimestamp(last_ts / 1000, tz=datetime.timezone.utc)
-                   .strftime("%H:%M:%S") if last_ts else "None")
-        bar_str = (datetime.datetime.utcfromtimestamp(
-                       hist_last["timestamp"].timestamp()
-                       if hasattr(hist_last["timestamp"], "timestamp")
-                       else hist_last["timestamp"] / 1000
-                   ).strftime("%m/%d %H:%M") if hist_last else "—")
+        ts_str  = (_fmt_central(datetime.datetime.fromtimestamp(
+                       last_ts / 1000, tz=datetime.timezone.utc
+                   )) if last_ts else "None")
+        if hist_last:
+            hist_ts = hist_last["timestamp"]
+            if hasattr(hist_ts, "to_pydatetime"):
+                hist_ts = hist_ts.to_pydatetime()
+            elif not hasattr(hist_ts, "tzinfo"):
+                hist_ts = datetime.datetime.fromtimestamp(hist_ts / 1000, tz=datetime.timezone.utc)
+            bar_str = _fmt_central(hist_ts, "%m/%d %H:%M %Z")
+        else:
+            bar_str = "—"
 
         lines += [
             f"**{ticker}**",
-            f"  last_ts fetched : `{ts_str} UTC`",
+            f"  last_ts fetched : `{ts_str}`",
             f"  acc cum_dollar  : `${acc._cum_dollar:,.0f}`",
             f"  acc threshold   : `${acc.threshold:,.0f}`",
             f"  acc bucket bars : `{len(acc._bucket)}`",
-            f"  history bars    : `{hist_len}`  (latest {bar_str} UTC)",
+            f"  history bars    : `{hist_len}`  (latest {bar_str})",
             "",
         ]
 
@@ -277,21 +298,21 @@ async def cmd_open(ctx: commands.Context, ticker: str, regime: str,
         await ctx.send("方向必须是 `LONG` 或 `SHORT`")
         return
 
-    now_utc = datetime.datetime.now(datetime.timezone.utc)
     if time_str:
         try:
-            h, m = map(int, time_str.split(":"))
-            now_utc = now_utc.replace(hour=h, minute=m, second=0, microsecond=0)
+            now_utc = _parse_central_time(time_str)
         except ValueError:
-            await ctx.send("时间格式错误，请用 `HH:MM`，例如 `14:30`")
+            await ctx.send("时间格式错误，请用美中时间 `HH:MM`，例如 `14:30`")
             return
+    else:
+        now_utc = _parse_central_time(None)
 
     key = f"{ticker}_{regime}"
     if key in open_positions:
         existing = open_positions[key]
         await ctx.send(
             f"⚠️ `{ticker} {regime}` 已有未平仓记录  "
-            f"({existing['direction']} @ ${existing['price']:,.2f})，"
+            f"({existing['direction']} @ ${existing['entry_price']:,.2f})，"
             f"请先 `!close` 平仓"
         )
         return
@@ -356,14 +377,14 @@ async def cmd_close(ctx: commands.Context, ticker: str, regime: str,
         else:
             time_str = pct_or_time  # it was actually a time string
 
-    now_utc = datetime.datetime.now(datetime.timezone.utc)
     if time_str:
         try:
-            h, m = map(int, time_str.split(":"))
-            now_utc = now_utc.replace(hour=h, minute=m, second=0, microsecond=0)
+            now_utc = _parse_central_time(time_str)
         except ValueError:
-            await ctx.send("时间格式错误，请用 `HH:MM`，例如 `16:00`")
+            await ctx.send("时间格式错误，请用美中时间 `HH:MM`，例如 `16:00`")
             return
+    else:
+        now_utc = _parse_central_time(None)
 
     remaining_before = pos["remaining_pct"]
     close_pct        = min(close_frac, remaining_before)
@@ -409,167 +430,20 @@ async def cmd_positions(ctx: commands.Context):
 
 
 @bot.command(name="signal")
-async def force_signal(ctx: commands.Context):
-    """Force-poll all tickers right now (for testing)."""
-    import yfinance as yf
-    from signals.engine import SIGNAL_CONFIG
-
-    now  = datetime.datetime.now(datetime.timezone.utc)
-    diag = [f"**Polling** `{now.strftime('%H:%M:%S')} UTC`", ""]
-
-    for ticker in SIGNAL_CONFIG:
-        try:
-            df = yf.Ticker(ticker).history(period="1d", interval="1m")
-            if df.empty:
-                diag.append(f"`{ticker}` — 无数据")
-            else:
-                last = df.iloc[-1]
-                ts   = df.index[-1].tz_convert("UTC").strftime("%H:%M")
-                diag.append(f"`{ticker}` — last @ {ts} UTC  close=`${last['Close']:.2f}`")
-        except Exception as e:
-            diag.append(f"`{ticker}` — 抓取失败: {e}")
-
-    await ctx.send("\n".join(diag))
-
-    # now actually poll for signals (in executor — XGBoost is CPU-blocking)
-    loop = asyncio.get_event_loop()
-    try:
-        signals = await loop.run_in_executor(None, engine.poll)
-    except Exception as e:
-        await ctx.send(f"Engine error: {e}")
-        return
-
-    if signals:
-        for sig in signals:
-            await ctx.send(format_signal(sig))
+async def cmd_signal(ctx: commands.Context, ticker: str = None):
+    """
+    显示当前模型预测。
+    用法: !signal          — 所有标的
+          !signal SPY      — 指定标的
+    """
+    loop  = asyncio.get_event_loop()
+    scans = await loop.run_in_executor(None, engine.scan)
+    if ticker:
+        scans = [s for s in scans if s.ticker == ticker.upper()]
+    if scans:
+        await ctx.send(format_predictions(scans))
     else:
-        scans = await loop.run_in_executor(None, engine.scan)
-        if scans:
-            await ctx.send(format_scan(scans))
-        else:
-            await ctx.send("暂无预测数据（历史 bar 不足）")
-
-
-@bot.command(name="analyze")
-async def analyze(ctx: commands.Context, ticker: str = None):
-    """
-    Run a full model analysis using the latest bar from the live engine history.
-    Shows predict_proba for every model regardless of threshold.
-
-    Usage:
-      !analyze          — analyze all tickers
-      !analyze SPY      — analyze one ticker
-    """
-    import pickle
-    import pandas as pd
-    import numpy as np
-    from signals.engine import (
-        SIGNAL_CONFIG, MODEL_DIR, BARS_DIR,
-        _compute_features, _rolling_vol,
-    )
-
-    tickers = [ticker.upper()] if ticker else list(SIGNAL_CONFIG.keys())
-    await ctx.send("分析中，请稍候...")
-
-    def _analyze_ticker(t: str) -> str:
-        import pandas as pd
-        from collections import deque
-        from signals.engine import HISTORY_LEN
-
-        # Prefer live engine history (updated by poll); fall back to parquet if engine not ready
-        history = engine.histories.get(t) if engine else None
-        if not history:
-            bar_path = BARS_DIR / f"{t}_dollar_bars.parquet"
-            if not bar_path.exists():
-                return f"`{t}` — 找不到 bar 数据，请先运行 pipeline"
-            df      = pd.read_parquet(bar_path)
-            history = deque(df.tail(HISTORY_LEN).to_dict("records"), maxlen=HISTORY_LEN)
-
-        last   = history[-1]
-        bar_ts = pd.Timestamp(last["timestamp"])
-        price  = last["close"]
-
-        lines = [
-            f"**── {t} 分析报告 ──**",
-            f"最新 bar: `{bar_ts.strftime('%Y-%m-%d %H:%M')} UTC`  收盘价 `${price:,.2f}`",
-            "",
-        ]
-
-        for regime, thr_long, thr_short, h, vol_lb, max_hold in SIGNAL_CONFIG.get(t, []):
-            model_path = MODEL_DIR / f"multi_xgb_{regime}.pkl"
-            if not model_path.exists():
-                model_path = MODEL_DIR / f"{t}_xgb_{regime}.pkl"
-            if not model_path.exists():
-                model_path = MODEL_DIR / f"{t}_rf_{regime}.pkl"
-            if not model_path.exists():
-                lines.append(f"`{regime}` — 模型文件不存在")
-                continue
-
-            with open(model_path, "rb") as f:
-                obj = pickle.load(f)
-
-            cfg          = obj["config"]
-            model        = obj["model"]
-            feat_cols    = obj["features"]
-            zscore_stats = obj.get("zscore_stats", {}).get(t, {})
-
-            feats = _compute_features(history, feat_cols, cfg, zscore_stats)
-            if feats is None:
-                lines.append(f"`{regime}` — 历史数据不足，无法计算特征")
-                continue
-
-            proba_arr    = model.predict_proba(feats)[0]
-            proba_long   = float(proba_arr[-1])
-            proba_short  = float(proba_arr[0])
-            proba_condor = float(proba_arr[1]) if len(proba_arr) > 2 else 0.0
-            vol          = _rolling_vol(history, vol_lb)
-
-            h_target = cfg.get("h_target", h)
-            h_stop   = cfg.get("h_stop",   h)
-            long_target  = price * (1 + h_target * vol)
-            long_stop    = price * (1 - h_stop   * vol)
-            short_target = price * (1 - h_target * vol)
-            short_stop   = price * (1 + h_stop   * vol)
-
-            if proba_long > thr_long:
-                verdict = "📈 **LONG 信号**"
-                conf    = proba_long
-                t_price, s_price = long_target, long_stop
-            elif proba_short > thr_short:
-                verdict = "📉 **SHORT 信号**"
-                conf    = proba_short
-                t_price, s_price = short_target, short_stop
-            elif proba_condor > max(proba_long, proba_short):
-                verdict = "🦅 **CONDOR 候选**"
-                conf    = proba_condor
-                t_price, s_price = long_target, long_stop
-            else:
-                verdict = "⬜ 未达阈值"
-                conf    = max(proba_long, proba_short, proba_condor)
-                t_price, s_price = long_target, long_stop
-
-            regime_cn  = {"intraday": "日内", "weekly": "1 周", "monthly": "1 个月"}.get(regime, regime)
-            days       = max_hold // 20
-            proba_line = f"P(多) `{proba_long:.1%}`  P(空) `{proba_short:.1%}`"
-            if proba_condor > 0:
-                proba_line += f"  P(condor) `{proba_condor:.1%}`"
-
-            lines += [
-                f"**{regime_cn}模型**  (多阈值 {thr_long}  空阈值 {thr_short})",
-                f"  {proba_line}  → {verdict}",
-                f"  置信度 `{conf:.1%}`  |  波动率 `{vol*100:.2f}%/bar`",
-                f"  目标价 `${t_price:,.2f}` ({(t_price/price-1)*100:+.2f}%)  "
-                f"止损价 `${s_price:,.2f}` ({(s_price/price-1)*100:+.2f}%)",
-                f"  持仓周期 {regime_cn} (~{days} 交易日)",
-                "",
-            ]
-
-        return "\n".join(lines)
-
-    loop = asyncio.get_event_loop()
-    for t in tickers:
-        msg = await loop.run_in_executor(None, _analyze_ticker, t)
-        await ctx.send(msg)
+        await ctx.send("暂无预测数据（引擎数据不足，请等待 warmup 完成）")
 
 
 # ── entry point ───────────────────────────────────────────────────────────────
