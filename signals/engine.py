@@ -561,6 +561,7 @@ class SignalEngine:
             proba_arr   = cfg["model"].predict_proba(feats)[0]
             proba_long  = float(proba_arr[-1])   # highest encoded = original +1
             proba_short = float(proba_arr[0])    # lowest  encoded = original -1
+            proba_neutral = float(proba_arr[1]) if len(proba_arr) > 2 else 0.0
 
             if proba_long > cfg["thr_long"]:
                 direction  = "LONG"
@@ -568,6 +569,9 @@ class SignalEngine:
             elif proba_short > cfg["thr_short"]:
                 direction  = "SHORT"
                 confidence = proba_short
+            elif len(proba_arr) > 2 and proba_neutral > max(cfg["thr_long"], cfg["thr_short"]):
+                direction  = "NEUTRAL"
+                confidence = proba_neutral
             else:
                 continue
 
@@ -585,12 +589,15 @@ class SignalEngine:
             if direction == "LONG":
                 target = entry * (1 + target_distance)
                 stop   = entry * (1 - stop_distance)
-            else:
+            elif direction == "SHORT":
                 target = entry * (1 - target_distance)
                 stop   = entry * (1 + stop_distance)
+            else:
+                target = entry
+                stop = entry
 
-            target_pct = target_distance * 100
-            stop_pct   = -stop_distance * 100
+            target_pct = target_distance * 100 if direction != "NEUTRAL" else 0.0
+            stop_pct   = -stop_distance * 100 if direction != "NEUTRAL" else 0.0
             days = int(cfg["max_hold"] / 20)  # 20 dollar bars ≈ 1 trading day
 
             # Only consider a signal when the recommended direction changes.

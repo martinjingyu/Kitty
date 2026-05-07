@@ -35,6 +35,10 @@ last_status_sent = None
 
 # Manual position journal: {f"{ticker}_{regime}": dict}
 open_positions: dict = {}
+active_signal_recommendations: dict = {}  # {ticker: dict}
+daily_signal_stats: dict = {}             # {ticker: {regime: {direction: {count, conf_sum}}}}
+daily_signal_stats_date = None
+daily_summary_sent_date = None
 
 _ET = ZoneInfo("America/New_York")
 _CT = ZoneInfo("America/Chicago")
@@ -44,6 +48,8 @@ REGULAR_CLOSE  = datetime.time(16, 0)  # 4:00 PM ET — regular session close
 STATUS_INTERVAL_HOURS = 1
 MAX_SIGNALS_PER_POLL = int(os.getenv("MAX_SIGNALS_PER_POLL", "3"))
 MAX_SCAN_ROWS = int(os.getenv("MAX_SCAN_ROWS", "5"))
+SUMMARY_REGIMES = {"weekly", "monthly"}
+SUMMARY_SEND_AFTER_CT = datetime.time(15, 10)  # 10 min after regular close in CT
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -75,6 +81,171 @@ def _fmt_central(dt: datetime.datetime, fmt: str = "%H:%M:%S %Z") -> str:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=datetime.timezone.utc)
     return dt.astimezone(_CT).strftime(fmt)
+
+
+def _current_ct_date(now: datetime.datetime | None = None):
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    return now.astimezone(_CT).date()
+
+
+def _ensure_signal_stats_day(now: datetime.datetime | None = None):
+    global daily_signal_stats_date, daily_signal_stats
+    today = _current_ct_date(now)
+    if daily_signal_stats_date != today:
+        daily_signal_stats_date = today
+        daily_signal_stats = {}
+
+
+def _record_daily_signal_stats(signals: list):
+    _ensure_signal_stats_day()
+    for sig in signals:
+        if sig.regime not in SUMMARY_REGIMES:
+            continue
+        by_regime = daily_signal_stats.setdefault(sig.ticker, {})
+        by_direction = by_regime.setdefault(sig.regime, {})
+        row = by_direction.setdefault(sig.direction, {"count": 0, "conf_sum": 0.0})
+        row["count"] += 1
+        row["conf_sum"] += sig.confidence
+
+
+def _empty_signal_stat() -> dict:
+    return {"count": 0, "conf_sum": 0.0}
+
+
+def _sum_direction_stats(by_direction: dict) -> dict:
+    out = _empty_signal_stat()
+    for row in by_direction.values():
+        out["count"] += row["count"]
+        out["conf_sum"] += row["conf_sum"]
+    return out
+
+
+def _direction_summary(by_direction: dict) -> str:
+    labels = [("LONG", "多"), ("SHORT", "空"), ("NEUTRAL", "铁鹰")]
+    parts = []
+    for direction, label in labels:
+        row = by_direction.get(direction)
+        if not row or not row["count"]:
+            continue
+        avg = row["conf_sum"] / row["count"]
+        parts.append(f"{label} `{row['count']}` 次 / `{avg:.1f}%`")
+    return "，".join(parts)
+
+
+def _format_daily_signal_summary() -> str:
+    _ensure_signal_stats_day()
+    date_str = daily_signal_stats_date.strftime("%Y-%m-%d") if daily_signal_stats_date else "今天"
+    if not daily_signal_stats:
+        return f"📋 **高周期信号总结** `{date_str}`\n\n今天没有触发 weekly/monthly 信号。"
+
+    rows = []
+    for ticker, by_regime in daily_signal_stats.items():
+        weekly_by_direction = by_regime.get("weekly", {})
+        monthly_by_direction = by_regime.get("monthly", {})
+        weekly = _sum_direction_stats(weekly_by_direction)
+        monthly = _sum_direction_stats(monthly_by_direction)
+        total_count = weekly["count"] + monthly["count"]
+        best_avg = 0.0
+        for by_direction in (weekly_by_direction, monthly_by_direction):
+            for row in by_direction.values():
+                if row["count"]:
+                    best_avg = max(best_avg, row["conf_sum"] / row["count"])
+        rows.append((ticker, weekly_by_direction, monthly_by_direction, weekly, monthly, total_count, best_avg))
+
+    rows.sort(key=lambda r: (r[5], r[6]), reverse=True)
+    lines = [f"📋 **高周期信号总结** `{date_str}`", ""]
+    for ticker, weekly_by_direction, monthly_by_direction, weekly, monthly, total_count, avg_conf in rows:
+        parts = []
+        if weekly["count"]:
+            parts.append(f"周线：{_direction_summary(weekly_by_direction)}")
+        if monthly["count"]:
+            parts.append(f"月线：{_direction_summary(monthly_by_direction)}")
+        lines.append(f"**{ticker}**  总计 `{total_count}` 次  ·  {'  ·  '.join(parts)}")
+
+    lines.append("")
+    lines.append("-# 统计对象：当天所有触发阈值的 weekly/monthly 候选；多=LONG，空=SHORT，铁鹰=monthly NEUTRAL。")
+    return "\n".join(lines)
+
+
+def _prune_signal_recommendations(now: datetime.datetime):
+    expired = [
+        ticker for ticker, rec in active_signal_recommendations.items()
+        if rec["expires_at"] <= now
+    ]
+    for ticker in expired:
+        del active_signal_recommendations[ticker]
+
+
+def _select_signals_for_send(signals: list) -> list:
+    """
+    Turn raw model events into a concise recommendation list.
+    Pick the strongest tickers for primary display while retaining same-ticker
+    secondary regime candidates for comparison.
+    """
+    now = datetime.datetime.now(datetime.timezone.utc)
+    _prune_signal_recommendations(now)
+
+    tradable = [sig for sig in signals if sig.direction in ("LONG", "SHORT")]
+    grouped = {}
+    for sig in sorted(tradable, key=lambda s: s.confidence, reverse=True):
+        grouped.setdefault(sig.ticker, []).append(sig)
+
+    primary = sorted((rows[0] for rows in grouped.values()), key=lambda s: s.confidence, reverse=True)
+    selected = []
+    for sig in primary[:MAX_SIGNALS_PER_POLL]:
+        selected.append({
+            "primary": sig,
+            "secondary": grouped[sig.ticker][1:],
+        })
+    return selected
+
+
+def _format_secondary_signals(signals: list) -> str:
+    if not signals:
+        return ""
+
+    regime_label = {"intraday": "日内", "weekly": "周线", "monthly": "月线"}
+    direction_label = {"LONG": "多", "SHORT": "空", "NEUTRAL": "铁鹰"}
+    parts = []
+    for sig in sorted(signals, key=lambda s: s.confidence, reverse=True):
+        target = f"{sig.target_pct:+.1f}%" if sig.direction != "NEUTRAL" else "—"
+        parts.append(
+            f"{regime_label.get(sig.regime, sig.regime)}"
+            f"{direction_label.get(sig.direction, sig.direction)}"
+            f" `{sig.confidence:.1f}%` 目标 `{target}`"
+        )
+
+    return "\n\n-# 同 ticker 其他周期： " + "  ·  ".join(parts)
+
+
+def _signal_context_note(sig) -> str:
+    active = active_signal_recommendations.get(sig.ticker)
+    if not active:
+        return ""
+    if active["direction"] != sig.direction:
+        return (
+            f"\n\n-# 🔄 观点更新：此前 {active['regime']} `{active['direction']}`，"
+            f"现在 {sig.regime} `{sig.direction}`。如已有仓位，请优先按止损/减仓规则处理。"
+        )
+    if active["regime"] != sig.regime:
+        return (
+            f"\n\n-# 同向补充：此前 {active['regime']} `{active['direction']}`，"
+            f"现在 {sig.regime} 也给出 `{sig.direction}`。"
+        )
+    return ""
+
+
+def _record_signal_sent(sig):
+    now = datetime.datetime.now(datetime.timezone.utc)
+    hold_days = max(sig.timeframe_days, 1)
+    active_signal_recommendations[sig.ticker] = {
+        "ticker": sig.ticker,
+        "regime": sig.regime,
+        "direction": sig.direction,
+        "sent_at": now,
+        "expires_at": now + datetime.timedelta(days=hold_days),
+        "confidence": sig.confidence,
+    }
 
 
 def _check_alarms() -> list[str]:
@@ -157,11 +328,14 @@ async def signal_loop():
         log.error(f"Engine poll error: {e}")
         return
 
-    signals = sorted(signals, key=lambda s: s.confidence, reverse=True)[:MAX_SIGNALS_PER_POLL]
-    for sig in signals:
-        msg = format_signal(sig)
+    _record_daily_signal_stats(signals)
+    signal_groups = _select_signals_for_send(signals)
+    for group in signal_groups:
+        sig = group["primary"]
+        msg = format_signal(sig) + _signal_context_note(sig) + _format_secondary_signals(group["secondary"])
         await _send(msg)
         engine.mark_signal_sent(sig)
+        _record_signal_sent(sig)
         last_signal_time[sig.ticker] = datetime.datetime.now(datetime.timezone.utc)
         log.info(f"Signal: {sig.ticker} {sig.regime} {sig.direction} @ {sig.entry_price}")
 
@@ -187,6 +361,19 @@ async def signal_loop():
         last_status_sent = now
 
 
+@tasks.loop(minutes=15)
+async def daily_summary_loop():
+    global daily_summary_sent_date
+    now_ct = datetime.datetime.now(_CT)
+    if now_ct.weekday() >= 5 or now_ct.time() < SUMMARY_SEND_AFTER_CT:
+        return
+    today = now_ct.date()
+    if daily_summary_sent_date == today:
+        return
+    await _send(_format_daily_signal_summary())
+    daily_summary_sent_date = today
+
+
 # ── events ────────────────────────────────────────────────────────────────────
 
 @bot.event
@@ -204,7 +391,9 @@ async def on_ready():
 
     if CHANNEL_ID:
         signal_loop.start()
+        daily_summary_loop.start()
         log.info(f"Signal loop started — polling every 1 min, window {MARKET_OPEN}–{MARKET_CLOSE} ET (weekdays only)")
+        log.info("Daily weekly/monthly summary loop started")
 
 
 @bot.event
@@ -269,6 +458,12 @@ async def status(ctx: commands.Context):
     """Manually trigger a status update."""
     msg = format_status(last_signal_time, list(SIGNAL_CONFIG.keys()))
     await ctx.send(msg)
+
+
+@bot.command(name="summary")
+async def summary(ctx: commands.Context):
+    """Show today's weekly/monthly trigger summary."""
+    await ctx.send(_format_daily_signal_summary())
 
 
 @bot.command(name="open")
