@@ -3,6 +3,7 @@ import os
 import sys
 import logging
 import datetime
+import subprocess
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -39,6 +40,7 @@ active_signal_recommendations: dict = {}  # {ticker: dict}
 daily_signal_stats: dict = {}             # {ticker: {regime: {direction: {count, conf_sum}}}}
 daily_signal_stats_date = None
 daily_summary_sent_date = None
+daily_hf_upload_sent_date = None
 
 _ET = ZoneInfo("America/New_York")
 _CT = ZoneInfo("America/Chicago")
@@ -50,6 +52,8 @@ MAX_SIGNALS_PER_POLL = int(os.getenv("MAX_SIGNALS_PER_POLL", "3"))
 MAX_SCAN_ROWS = int(os.getenv("MAX_SCAN_ROWS", "5"))
 SUMMARY_REGIMES = {"weekly", "monthly"}
 SUMMARY_SEND_AFTER_CT = datetime.time(15, 10)  # 10 min after regular close in CT
+AUTO_HF_UPLOAD_ENABLED = os.getenv("AUTO_HF_UPLOAD_AFTER_CLOSE", "0").lower() in ("1", "true", "yes")
+AUTO_HF_UPLOAD_AFTER_CT = datetime.time(15, 20)  # after summary, still close to market close
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -374,6 +378,42 @@ async def daily_summary_loop():
     daily_summary_sent_date = today
 
 
+def _run_hf_upload_once() -> tuple[bool, str]:
+    cmd = [sys.executable, "scripts/upload_to_hf.py"]
+    proc = subprocess.run(
+        cmd,
+        cwd=Path(__file__).parent,
+        text=True,
+        capture_output=True,
+        timeout=60 * 60,
+    )
+    output = "\n".join(part for part in (proc.stdout.strip(), proc.stderr.strip()) if part)
+    return proc.returncode == 0, output[-1500:]
+
+
+@tasks.loop(minutes=15)
+async def daily_hf_upload_loop():
+    global daily_hf_upload_sent_date
+    if not AUTO_HF_UPLOAD_ENABLED:
+        return
+    now_ct = datetime.datetime.now(_CT)
+    if now_ct.weekday() >= 5 or now_ct.time() < AUTO_HF_UPLOAD_AFTER_CT:
+        return
+    today = now_ct.date()
+    if daily_hf_upload_sent_date == today:
+        return
+
+    loop = asyncio.get_event_loop()
+    ok, output = await loop.run_in_executor(None, _run_hf_upload_once)
+    daily_hf_upload_sent_date = today
+    if ok:
+        await _send("☁️ **Hugging Face 上传完成**\n\n-# raw data / models 已同步。")
+        log.info("Daily Hugging Face upload complete: %s", output)
+    else:
+        await _send(f"⚠️ **Hugging Face 上传失败**\n\n```text\n{output or 'No output'}\n```")
+        log.error("Daily Hugging Face upload failed: %s", output)
+
+
 # ── events ────────────────────────────────────────────────────────────────────
 
 @bot.event
@@ -392,8 +432,11 @@ async def on_ready():
     if CHANNEL_ID:
         signal_loop.start()
         daily_summary_loop.start()
+        daily_hf_upload_loop.start()
         log.info(f"Signal loop started — polling every 1 min, window {MARKET_OPEN}–{MARKET_CLOSE} ET (weekdays only)")
         log.info("Daily weekly/monthly summary loop started")
+        if AUTO_HF_UPLOAD_ENABLED:
+            log.info("Daily Hugging Face upload loop started")
 
 
 @bot.event

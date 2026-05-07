@@ -150,21 +150,13 @@ POLYGON_API_KEY=your_polygon_api_key
 ```bash
 bash start.sh pipeline
 # or
-python3 scripts/run_pipeline.py
+python3 scripts/run_pipeline.py --tickers AAPL MSFT NVDA GOOGL AMZN META TSLA WMT MS JPM BE PLTR SPY IBM IWM MU SNDK CRWV NBIS INTC AMD ORCL COIN MSTR
 ```
 
 After updating bar-construction logic, use `--force` to rebuild from raw data:
 
 ```bash
-python3 scripts/run_pipeline.py --force
-```
-
-Train only selected regimes:
-
-```bash
-python3 scripts/run_pipeline.py --regimes intraday
-python3 scripts/run_pipeline.py --tickers SPY AAPL NVDA --regimes intraday
-python3 scripts/build_and_train.py --tickers SPY AAPL NVDA --regimes intraday weekly
+python3 scripts/run_pipeline.py --tickers AAPL MSFT NVDA GOOGL AMZN META TSLA WMT MS JPM BE PLTR SPY IBM IWM MU SNDK CRWV NBIS INTC AMD ORCL COIN MSTR --force
 ```
 
 ### 4. Tune intraday boundaries
@@ -234,6 +226,66 @@ bash start.sh bot
 ```
 
 The bot only polls during **US market hours (Mon–Fri, 4:00 AM – 8:00 PM ET)**. It is idle on weekends and outside those hours.
+
+### 6. Upload artifacts to Hugging Face
+
+Configure `.env`:
+
+```
+HF_TOKEN=your_huggingface_token
+HF_RAW_REPO_ID=your_username/kitty-raw-data
+HF_MODEL_REPO_ID=your_username/kitty-models
+AUTO_HF_UPLOAD_AFTER_CLOSE=0
+```
+
+Upload both raw data and trained models:
+
+```bash
+bash start.sh upload
+```
+
+Or specify repos directly:
+
+```bash
+python3 scripts/upload_to_hf.py \
+  --raw-repo-id your_username/kitty-raw-data \
+  --model-repo-id your_username/kitty-models \
+  --private
+```
+
+Dry-run without uploading:
+
+```bash
+python3 scripts/upload_to_hf.py --raw-repo-id your_username/kitty-raw-data --model-repo-id your_username/kitty-models --dry-run
+```
+
+Download artifacts back to a fresh checkout:
+
+```bash
+bash start.sh download
+```
+
+Or download only one artifact type:
+
+```bash
+python3 scripts/download_from_hf.py --raw-only
+python3 scripts/download_from_hf.py --models-only
+```
+
+On first run, `bash start.sh bot` will try to download models when `models/saved/*.pkl`
+is missing, and `bash start.sh pipeline` will try to download raw data when
+`data/raw/*.parquet` is missing. Existing local files are kept unless you run
+`scripts/download_from_hf.py --force`.
+
+To upload artifacts automatically after the market close, set:
+
+```
+AUTO_HF_UPLOAD_AFTER_CLOSE=1
+```
+
+When enabled, the bot runs `scripts/upload_to_hf.py` once per weekday after
+`15:20 CT`, shortly after the daily summary. It requires `HF_RAW_REPO_ID` and/or
+`HF_MODEL_REPO_ID` to be configured.
 
 ## Bot Commands
 
