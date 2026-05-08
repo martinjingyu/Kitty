@@ -81,7 +81,7 @@ All six tickers share a single pooled model per regime:
 
 📈 模型仍看多 (68.3%)，可考虑部分止盈继续持仓
 
-!close CRWV intraday <价格> [50%] [HH:MM]
+请在 moomoo 中按实际仓位处理；bot 会继续读取真实持仓。
 ```
 
 ### SL alarm (model-driven)
@@ -134,9 +134,14 @@ Edit `.env`:
 
 ```
 DISCORD_TOKEN=your_discord_bot_token
-SCHEDULE_CHANNEL_ID=your_channel_id
+SIGNAL_CHANNEL_ID=live_signal_channel_id
+INTERACTION_CHANNEL_ID=interaction_channel_id
+POSITION_CHANNEL_ID=position_risk_channel_id
 POLYGON_API_KEY=your_polygon_api_key
 ```
+
+`SCHEDULE_CHANNEL_ID` is still supported as a fallback when the dedicated
+channel IDs are not configured.
 
 **Discord setup:**
 - Create a bot at [discord.com/developers/applications](https://discord.com/developers/applications)
@@ -296,25 +301,58 @@ When enabled, the bot runs `scripts/upload_to_hf.py` once per weekday after
 | `!ping` | Check bot latency |
 | `!status` | Show last signal time per ticker |
 | `!signal` | Force-poll now; shows current predict_proba if no threshold crossed |
+| `!track TICKER` | Add ticker to the continuous interaction-channel tracker |
+| `!untrack TICKER` | Remove ticker from the continuous tracker |
+| `!tracklist` | Show currently tracked tickers |
 | `!analyze [TICKER]` | Full model breakdown — all regimes, probabilities, TP/SL levels |
 
-### Position journal
+### Actual positions
 
 | Command | Example | Description |
 |---------|---------|-------------|
-| `!open TICKER REGIME DIR PRICE [HH:MM]` | `!open SPY intraday LONG 580.50` | Record opening a position; auto-calculates TP target |
-| `!close TICKER REGIME PRICE [PCT%] [HH:MM]` | `!close SPY intraday 583.20 50%` | Record close (full or partial); computes P&L |
-| `!positions` | — | List all open positions with current hold time |
+| `!positions` | — | Fetch actual moomoo/OpenD positions into the position channel |
+| `!broker_positions` | — | Same as `!positions` |
+| `!open ...` | — | Disabled; positions come from moomoo only |
+| `!close ...` | — | Disabled; close or reduce positions in moomoo |
 
-**Partial close example:**
-```
-!close SPY intraday 583.20 50%   → closes half, remainder stays monitored
-!close SPY intraday 585.00       → closes remaining half
-```
+Kitty no longer keeps a manual position journal. The position channel is based
+on actual broker positions only.
 
 ## TP / SL Alarm Logic
 
-Every minute, for each open position:
+## Moomoo Actual Positions
+
+Kitty can read actual positions from moomoo/OpenD in read-only mode. Start and
+log in to OpenD first, then configure `.env`:
+
+```
+MOOMOO_POSITIONS_ENABLED=1
+MOOMOO_HOST=127.0.0.1
+MOOMOO_PORT=11111
+MOOMOO_TRD_MARKET=US
+MOOMOO_TRD_ENV=REAL
+MOOMOO_ACC_ID=0
+MOOMOO_ACC_INDEX=0
+MOOMOO_SECURITY_FIRM=FUTUINC
+```
+
+Then run:
+
+```text
+!broker_positions
+```
+
+To post a broker position snapshot automatically to the position channel every
+30 minutes during the signal loop:
+
+```
+MOOMOO_AUTO_POSITION_SNAPSHOT=1
+```
+
+The integration calls `position_list_query` only; it does not unlock trading or
+place orders.
+
+During each signal loop, for each actual broker position:
 
 **Stop-loss (model-driven)**
 - Calls `model.predict_proba()` for the position's ticker/regime

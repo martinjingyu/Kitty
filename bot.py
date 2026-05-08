@@ -15,8 +15,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from signals.engine    import SignalEngine, SIGNAL_CONFIG, TARGET_RETURN_FLOOR
 from signals.formatter import (format_signal, format_status, format_predictions,
-                                format_open_confirm, format_close_confirm,
-                                format_sl_alarm, format_tp_alarm)
+                                format_sl_alarm)
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -27,20 +26,33 @@ intents.message_content = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-CHANNEL_ID = int(os.getenv("SCHEDULE_CHANNEL_ID", "0"))
+def _env_int(name: str, default: int = 0) -> int:
+    raw = os.getenv(name)
+    return int(raw) if raw else default
+
+
+LEGACY_CHANNEL_ID = _env_int("SCHEDULE_CHANNEL_ID")
+SIGNAL_CHANNEL_ID = _env_int("SIGNAL_CHANNEL_ID", LEGACY_CHANNEL_ID)
+INTERACTION_CHANNEL_ID = _env_int("INTERACTION_CHANNEL_ID", LEGACY_CHANNEL_ID)
+POSITION_CHANNEL_ID = _env_int("POSITION_CHANNEL_ID", SIGNAL_CHANNEL_ID)
+MOOMOO_POSITIONS_ENABLED = os.getenv("MOOMOO_POSITIONS_ENABLED", "0").lower() in ("1", "true", "yes")
+MOOMOO_AUTO_POSITION_SNAPSHOT = os.getenv("MOOMOO_AUTO_POSITION_SNAPSHOT", "0").lower() in ("1", "true", "yes")
 
 # ── state ─────────────────────────────────────────────────────────────────────
 engine = None
 last_signal_time: dict = {}   # {ticker: datetime}
 last_status_sent = None
 
-# Manual position journal: {f"{ticker}_{regime}": dict}
-open_positions: dict = {}
+broker_positions: dict = {}  # {ticker: BrokerPosition}
+broker_sl_alerted: set[str] = set()
+tracked_tickers: set[str] = set()
 active_signal_recommendations: dict = {}  # {ticker: dict}
 daily_signal_stats: dict = {}             # {ticker: {regime: {direction: {count, conf_sum}}}}
 daily_signal_stats_date = None
 daily_summary_sent_date = None
 daily_hf_upload_sent_date = None
+last_broker_position_refresh = None
+last_broker_position_snapshot = None
 
 _ET = ZoneInfo("America/New_York")
 _CT = ZoneInfo("America/Chicago")
@@ -136,6 +148,54 @@ def _direction_summary(by_direction: dict) -> str:
     return "，".join(parts)
 
 
+def _direction_count(by_direction: dict, direction: str) -> int:
+    return by_direction.get(direction, {}).get("count", 0)
+
+
+def _direction_avg(by_direction: dict, direction: str) -> float:
+    row = by_direction.get(direction)
+    if not row or not row["count"]:
+        return 0.0
+    return row["conf_sum"] / row["count"]
+
+
+def _direction_score(by_direction: dict, direction: str) -> float:
+    return _direction_count(by_direction, direction) * _direction_avg(by_direction, direction)
+
+
+def _classify_signal_summary(weekly_by_direction: dict, monthly_by_direction: dict) -> tuple[int, str]:
+    w_long = _direction_count(weekly_by_direction, "LONG")
+    w_short = _direction_count(weekly_by_direction, "SHORT")
+    m_long = _direction_count(monthly_by_direction, "LONG")
+    m_short = _direction_count(monthly_by_direction, "SHORT")
+    m_neutral = _direction_count(monthly_by_direction, "NEUTRAL")
+
+    long_score = _direction_score(weekly_by_direction, "LONG") + _direction_score(monthly_by_direction, "LONG")
+    short_score = _direction_score(weekly_by_direction, "SHORT") + _direction_score(monthly_by_direction, "SHORT")
+    neutral_score = _direction_score(monthly_by_direction, "NEUTRAL")
+
+    has_long = w_long + m_long > 0
+    has_short = w_short + m_short > 0
+    has_monthly_long = m_long > 0
+    has_monthly_short = m_short > 0
+    has_weekly_long = w_long > 0
+    has_weekly_short = w_short > 0
+
+    if has_long and has_short and min(long_score, short_score) >= max(long_score, short_score) * 0.25:
+        return 1, "⚠️ 多空冲突"
+    if has_weekly_long and has_monthly_long and short_score <= long_score * 0.25:
+        return 0, "✅ 多头共振"
+    if has_weekly_short and has_monthly_short and long_score <= short_score * 0.25:
+        return 0, "✅ 空头共振"
+    if m_neutral and neutral_score >= max(long_score, short_score) * 0.6:
+        return 2, "🦅 铁鹰/震荡"
+    if long_score > short_score:
+        return 3, "📈 偏多观察"
+    if short_score > long_score:
+        return 3, "📉 偏空观察"
+    return 4, "⬜ 观察"
+
+
 def _format_daily_signal_summary() -> str:
     _ensure_signal_stats_day()
     date_str = daily_signal_stats_date.strftime("%Y-%m-%d") if daily_signal_stats_date else "今天"
@@ -154,20 +214,21 @@ def _format_daily_signal_summary() -> str:
             for row in by_direction.values():
                 if row["count"]:
                     best_avg = max(best_avg, row["conf_sum"] / row["count"])
-        rows.append((ticker, weekly_by_direction, monthly_by_direction, weekly, monthly, total_count, best_avg))
+        rank, label = _classify_signal_summary(weekly_by_direction, monthly_by_direction)
+        rows.append((rank, ticker, label, weekly_by_direction, monthly_by_direction, weekly, monthly, total_count, best_avg))
 
-    rows.sort(key=lambda r: (r[5], r[6]), reverse=True)
+    rows.sort(key=lambda r: (r[0], -r[7], -r[8]))
     lines = [f"📋 **高周期信号总结** `{date_str}`", ""]
-    for ticker, weekly_by_direction, monthly_by_direction, weekly, monthly, total_count, avg_conf in rows:
+    for _, ticker, label, weekly_by_direction, monthly_by_direction, weekly, monthly, total_count, _ in rows:
         parts = []
         if weekly["count"]:
             parts.append(f"周线：{_direction_summary(weekly_by_direction)}")
         if monthly["count"]:
             parts.append(f"月线：{_direction_summary(monthly_by_direction)}")
-        lines.append(f"**{ticker}**  总计 `{total_count}` 次  ·  {'  ·  '.join(parts)}")
+        lines.append(f"{label}  **{ticker}**  总计 `{total_count}` 次  ·  {'  ·  '.join(parts)}")
 
     lines.append("")
-    lines.append("-# 统计对象：当天所有触发阈值的 weekly/monthly 候选；多=LONG，空=SHORT，铁鹰=monthly NEUTRAL。")
+    lines.append("-# 标签按高周期方向一致性和强度自动归类；多=LONG，空=SHORT，铁鹰=monthly NEUTRAL。")
     return "\n".join(lines)
 
 
@@ -252,67 +313,82 @@ def _record_signal_sent(sig):
     }
 
 
+def _filter_scans_for_tickers(scans: list, tickers: set[str]) -> list:
+    wanted = {ticker.upper() for ticker in tickers}
+    return [s for s in scans if s.ticker in wanted]
+
+
+def _broker_direction(pos) -> str:
+    side = str(pos.side).upper()
+    if "SHORT" in side:
+        return "SHORT"
+    if pos.qty < 0:
+        return "SHORT"
+    return "LONG"
+
+
+def _broker_position_alarm_dict(pos, regime: str, direction: str) -> dict:
+    return {
+        "ticker": pos.ticker,
+        "regime": regime,
+        "direction": direction,
+        "entry_price": pos.cost or pos.price,
+        "last_price": pos.price,
+    }
+
+
 def _check_alarms() -> list[str]:
     """
     Sync function (run in executor).
-    Returns list of formatted alarm messages for open positions.
+    Returns model-driven risk alarm messages for actual broker positions.
 
-    SL: P(against_direction) > threshold for that regime
-    TP: latest bar price crossed the target level
+    SL: P(against_direction) > threshold for that regime.
     """
-    if not engine or not open_positions:
+    if not engine or not broker_positions:
         return []
 
     msgs = []
-    for key, pos in list(open_positions.items()):
-        ticker    = pos["ticker"]
-        regime    = pos["regime"]
-        direction = pos["direction"]
-
-        proba = engine.get_proba(ticker, regime)
-        if proba is None:
-            continue
-        proba_long, proba_short, _ = proba
-
-        # Threshold for this regime
-        regime_entry = next((e for e in SIGNAL_CONFIG.get(ticker, []) if e[0] == regime), None)
-        thr = regime_entry[1] if regime_entry else 0.50  # thr_long as proxy
-
-        proba_against = proba_short if direction == "LONG" else proba_long
-
-        # Update last seen price for SL alarm P&L display
-        hist = engine.histories.get(ticker)
-        if hist:
-            open_positions[key]["last_price"] = hist[-1]["close"]
-
-        # ── SL: model confidence against position exceeds threshold ──────────
-        if proba_against > thr:
-            if not pos.get("sl_alerted"):
-                msgs.append(format_sl_alarm(pos, proba_against, proba_long, proba_short))
-                open_positions[key]["sl_alerted"] = True
-        else:
-            if pos.get("sl_alerted"):
-                open_positions[key]["sl_alerted"] = False  # model normalised — reset
-
-        # ── TP: price crossed target ──────────────────────────────────────────
-        if pos.get("tp_alerted") or pos.get("target") is None or not hist:
-            continue
-        last_bar = hist[-1]
-        hit = (direction == "LONG"  and last_bar["high"] >= pos["target"]) or \
-              (direction == "SHORT" and last_bar["low"]  <= pos["target"])
-        if hit:
-            msgs.append(format_tp_alarm(pos, last_bar["close"], proba_long, proba_short))
-            open_positions[key]["tp_alerted"] = True
+    for ticker, broker_pos in list(broker_positions.items()):
+        direction = _broker_direction(broker_pos)
+        for regime_entry in SIGNAL_CONFIG.get(ticker, []):
+            regime, thr_long, thr_short, *_ = regime_entry
+            proba = engine.get_proba(ticker, regime)
+            if proba is None:
+                continue
+            proba_long, proba_short, _ = proba
+            proba_against = proba_short if direction == "LONG" else proba_long
+            thr = thr_short if direction == "LONG" else thr_long
+            key = f"{ticker}_{regime}"
+            alarm_pos = _broker_position_alarm_dict(broker_pos, regime, direction)
+            if proba_against > thr:
+                if key not in broker_sl_alerted:
+                    msgs.append(format_sl_alarm(alarm_pos, proba_against, proba_long, proba_short))
+                    broker_sl_alerted.add(key)
+            else:
+                broker_sl_alerted.discard(key)
 
     return msgs
 
 
-async def _send(content: str):
-    channel = bot.get_channel(CHANNEL_ID)
+async def _send(content: str, channel_id: int | None = None):
+    channel_id = channel_id or SIGNAL_CHANNEL_ID
+    channel = bot.get_channel(channel_id)
     if channel:
         await channel.send(content)
     else:
-        log.warning(f"Channel {CHANNEL_ID} not found")
+        log.warning(f"Channel {channel_id} not found")
+
+
+async def _send_signal(content: str):
+    await _send(content, SIGNAL_CHANNEL_ID)
+
+
+async def _send_interaction(content: str):
+    await _send(content, INTERACTION_CHANNEL_ID)
+
+
+async def _send_position(content: str):
+    await _send(content, POSITION_CHANNEL_ID)
 
 
 # ── tasks ─────────────────────────────────────────────────────────────────────
@@ -337,17 +413,52 @@ async def signal_loop():
     for group in signal_groups:
         sig = group["primary"]
         msg = format_signal(sig) + _signal_context_note(sig) + _format_secondary_signals(group["secondary"])
-        await _send(msg)
+        await _send_signal(msg)
         engine.mark_signal_sent(sig)
         _record_signal_sent(sig)
         last_signal_time[sig.ticker] = datetime.datetime.now(datetime.timezone.utc)
         log.info(f"Signal: {sig.ticker} {sig.regime} {sig.direction} @ {sig.entry_price}")
 
-    # Check TP/SL alarms for open positions
-    if open_positions:
+    if tracked_tickers:
+        try:
+            scans = await loop.run_in_executor(None, engine.scan)
+            scans = _filter_scans_for_tickers(scans, tracked_tickers)
+            if scans:
+                await _send_interaction(format_predictions(scans))
+        except Exception as e:
+            log.error(f"Track scan error: {e}")
+
+    if MOOMOO_POSITIONS_ENABLED:
+        global last_broker_position_refresh, last_broker_position_snapshot
+        now = datetime.datetime.now(datetime.timezone.utc)
+        try:
+            if (
+                last_broker_position_refresh is None
+                or (now - last_broker_position_refresh).total_seconds() >= 5 * 60
+            ):
+                await loop.run_in_executor(None, _refresh_broker_positions, False)
+                last_broker_position_refresh = now
+        except Exception as e:
+            log.error(f"Moomoo position refresh error: {e}")
+
+    # Check model-driven risk alarms for actual broker positions
+    if broker_positions:
         alarms = await loop.run_in_executor(None, _check_alarms)
         for alarm_msg in alarms:
-            await _send(alarm_msg)
+            await _send_position(alarm_msg)
+
+    if MOOMOO_POSITIONS_ENABLED and MOOMOO_AUTO_POSITION_SNAPSHOT:
+        now = datetime.datetime.now(datetime.timezone.utc)
+        if (
+            last_broker_position_snapshot is None
+            or (now - last_broker_position_snapshot).total_seconds() >= 30 * 60
+        ):
+            try:
+                msg = await loop.run_in_executor(None, _refresh_broker_positions, False)
+                await _send_position(msg)
+                last_broker_position_snapshot = now
+            except Exception as e:
+                log.error(f"Moomoo position snapshot error: {e}")
 
     # hourly status if no signals recently
     now = datetime.datetime.now(datetime.timezone.utc)
@@ -361,7 +472,7 @@ async def signal_loop():
     )
     if need_status and not any_recent:
         msg = format_status(last_signal_time, list(SIGNAL_CONFIG.keys()))
-        await _send(msg)
+        await _send_signal(msg)
         last_status_sent = now
 
 
@@ -374,7 +485,7 @@ async def daily_summary_loop():
     today = now_ct.date()
     if daily_summary_sent_date == today:
         return
-    await _send(_format_daily_signal_summary())
+    await _send_signal(_format_daily_signal_summary())
     daily_summary_sent_date = today
 
 
@@ -389,6 +500,16 @@ def _run_hf_upload_once() -> tuple[bool, str]:
     )
     output = "\n".join(part for part in (proc.stdout.strip(), proc.stderr.strip()) if part)
     return proc.returncode == 0, output[-1500:]
+
+
+def _refresh_broker_positions(refresh_cache: bool = False) -> str:
+    global broker_positions
+    from integrations.moomoo_positions import fetch_positions, format_broker_positions
+    positions = fetch_positions(refresh_cache=refresh_cache)
+    broker_positions = {pos.ticker: pos for pos in positions}
+    active = set(broker_positions)
+    broker_sl_alerted.intersection_update(active)
+    return format_broker_positions(positions)
 
 
 @tasks.loop(minutes=15)
@@ -407,10 +528,10 @@ async def daily_hf_upload_loop():
     ok, output = await loop.run_in_executor(None, _run_hf_upload_once)
     daily_hf_upload_sent_date = today
     if ok:
-        await _send("☁️ **Hugging Face 上传完成**\n\n-# raw data / models 已同步。")
+        await _send_interaction("☁️ **Hugging Face 上传完成**\n\n-# raw data / models 已同步。")
         log.info("Daily Hugging Face upload complete: %s", output)
     else:
-        await _send(f"⚠️ **Hugging Face 上传失败**\n\n```text\n{output or 'No output'}\n```")
+        await _send_interaction(f"⚠️ **Hugging Face 上传失败**\n\n```text\n{output or 'No output'}\n```")
         log.error("Daily Hugging Face upload failed: %s", output)
 
 
@@ -429,7 +550,7 @@ async def on_ready():
     await loop.run_in_executor(None, engine.warmup)
     log.info("Warmup complete")
 
-    if CHANNEL_ID:
+    if SIGNAL_CHANNEL_ID:
         signal_loop.start()
         daily_summary_loop.start()
         daily_hf_upload_loop.start()
@@ -510,154 +631,51 @@ async def summary(ctx: commands.Context):
 
 
 @bot.command(name="open")
-async def cmd_open(ctx: commands.Context, ticker: str, regime: str,
-                   direction: str, price: float, time_str: str = None):
-    """
-    记录手动开仓。
-    用法: !open <TICKER> <regime> <LONG|SHORT> <价格> [HH:MM]
-    示例: !open SPY intraday LONG 580.50
-          !open NVDA weekly SHORT 118.00 14:30
-    """
-    ticker    = ticker.upper()
-    direction = direction.upper()
-    if direction not in ("LONG", "SHORT"):
-        await ctx.send("方向必须是 `LONG` 或 `SHORT`")
-        return
-
-    if time_str:
-        try:
-            now_utc = _parse_central_time(time_str)
-        except ValueError:
-            await ctx.send("时间格式错误，请用美中时间 `HH:MM`，例如 `14:30`")
-            return
-    else:
-        now_utc = _parse_central_time(None)
-
-    key = f"{ticker}_{regime}"
-    if key in open_positions:
-        existing = open_positions[key]
-        await ctx.send(
-            f"⚠️ `{ticker} {regime}` 已有未平仓记录  "
-            f"({existing['direction']} @ ${existing['entry_price']:,.2f})，"
-            f"请先 `!close` 平仓"
-        )
-        return
-
-    # Auto-calculate TP target from model config + current vol
-    target = None
-    try:
-        from signals.engine import _rolling_vol
-        regime_entry = next((e for e in SIGNAL_CONFIG.get(ticker, []) if e[0] == regime), None)
-        if regime_entry and engine and engine.histories.get(ticker):
-            _, _, _, h, vol_lb, _ = regime_entry
-            vol      = _rolling_vol(engine.histories[ticker], vol_lb)
-            cfg      = engine.models.get(ticker, {}).get(regime, {})
-            h_target = cfg.get("h_target", h)
-            target_floor = max(
-                TARGET_RETURN_FLOOR.get(regime, 0.0),
-                cfg.get("min_target_return", 0.0),
-            )
-            target_distance = max(h_target * vol, target_floor)
-            target   = price * (1 + target_distance) if direction == "LONG" else price * (1 - target_distance)
-            target   = round(target, 2)
-    except Exception:
-        pass
-
-    open_positions[key] = {
-        "ticker":        ticker,
-        "regime":        regime,
-        "direction":     direction,
-        "entry_price":   price,
-        "time":          now_utc,
-        "target":        target,
-        "remaining_pct": 1.0,
-        "last_price":    price,
-        "tp_alerted":    False,
-        "sl_alerted":    False,
-    }
-    await ctx.send(format_open_confirm(ticker, regime, direction, price, now_utc, target))
-    log.info(f"Manual open: {key} {direction} @ {price}  target={target}")
+async def cmd_open(ctx: commands.Context, *_):
+    """Deprecated: positions now come from moomoo/OpenD only."""
+    await ctx.send("`!open` 已停用。现在仓位只读取 moomoo 实际持仓，请用 `!positions` 查看。")
 
 
 @bot.command(name="close")
-async def cmd_close(ctx: commands.Context, ticker: str, regime: str,
-                    price: float, pct_or_time: str = None, time_str: str = None):
-    """
-    记录手动平仓（支持部分平仓），计算盈亏。
-    用法: !close <TICKER> <regime> <出场价> [50%] [HH:MM]
-    示例: !close SPY intraday 583.20
-          !close SPY intraday 583.20 50%
-          !close NVDA weekly 115.50 50% 16:00
-    """
-    ticker = ticker.upper()
-    key    = f"{ticker}_{regime}"
-    pos    = open_positions.get(key)
-    if pos is None:
-        await ctx.send(f"⚠️ 找不到 `{ticker} {regime}` 的开仓记录")
-        return
-
-    # Parse optional pct_or_time: could be "50%" or "16:00"
-    close_frac = 1.0
-    if pct_or_time:
-        if pct_or_time.endswith("%"):
-            try:
-                close_frac = float(pct_or_time.rstrip("%")) / 100
-            except ValueError:
-                await ctx.send("百分比格式错误，例如 `50%`")
-                return
-        else:
-            time_str = pct_or_time  # it was actually a time string
-
-    if time_str:
-        try:
-            now_utc = _parse_central_time(time_str)
-        except ValueError:
-            await ctx.send("时间格式错误，请用美中时间 `HH:MM`，例如 `16:00`")
-            return
-    else:
-        now_utc = _parse_central_time(None)
-
-    remaining_before = pos["remaining_pct"]
-    close_pct        = min(close_frac, remaining_before)
-    remaining_after  = round(remaining_before - close_pct, 4)
-
-    msg = format_close_confirm(
-        ticker, regime, pos["direction"],
-        pos["entry_price"], price,
-        pos["time"], now_utc,
-        close_pct=close_pct, remaining_pct=remaining_after,
-    )
-
-    if remaining_after <= 0:
-        del open_positions[key]
-        log.info(f"Full close: {key} {pos['direction']} {pos['entry_price']} → {price}")
-    else:
-        open_positions[key]["remaining_pct"] = remaining_after
-        open_positions[key]["tp_alerted"]    = False  # reset so TP can re-trigger on remainder
-        log.info(f"Partial close: {key} {close_pct:.0%} closed, {remaining_after:.0%} remaining")
-
-    await ctx.send(msg)
+async def cmd_close(ctx: commands.Context, *_):
+    """Deprecated: positions now come from moomoo/OpenD only."""
+    await ctx.send("`!close` 已停用。请在 moomoo 里实际平仓；bot 会从 moomoo 读取最新持仓。")
 
 
 @bot.command(name="positions")
 async def cmd_positions(ctx: commands.Context):
-    """显示当前所有未平仓记录。"""
-    if not open_positions:
-        await ctx.send("当前没有未平仓记录")
+    """Fetch actual moomoo/OpenD positions and send them to the position channel."""
+    if not MOOMOO_POSITIONS_ENABLED:
+        await ctx.send("moomoo 持仓读取未启用，请设置 `MOOMOO_POSITIONS_ENABLED=1`。")
         return
 
-    now_utc = datetime.datetime.now(datetime.timezone.utc)
-    lines   = ["**── 持仓记录 ──**", ""]
-    for pos in open_positions.values():
-        regime_cn = {"intraday": "日内", "weekly": "1 周", "monthly": "1 个月"}.get(pos["regime"], pos["regime"])
-        held_min  = int((now_utc - pos["time"]).total_seconds() / 60)
-        held_str  = f"{held_min // 60}h {held_min % 60:02d}m" if held_min >= 60 else f"{held_min}m"
-        icon      = "📈" if pos["direction"] == "LONG" else "📉"
-        lines.append(
-            f"{icon} **{pos['ticker']}** [{regime_cn}]  "
-            f"`{pos['direction']}` @ `${pos['entry_price']:,.2f}`  · 已持仓 {held_str}"
-        )
-    await ctx.send("\n".join(lines))
+    loop = asyncio.get_event_loop()
+    try:
+        msg = await loop.run_in_executor(None, _refresh_broker_positions, True)
+    except Exception as e:
+        await ctx.send(f"读取 moomoo 持仓失败：`{e}`")
+        return
+
+    await _send_position(msg)
+    if ctx.channel.id != POSITION_CHANNEL_ID:
+        await ctx.send("实际持仓已发送到 position channel。")
+
+
+@bot.command(name="broker_positions")
+async def cmd_broker_positions(ctx: commands.Context):
+    """Fetch actual moomoo/OpenD positions and send them to the position channel."""
+    if not MOOMOO_POSITIONS_ENABLED:
+        await ctx.send("moomoo 持仓读取未启用，请设置 `MOOMOO_POSITIONS_ENABLED=1`。")
+        return
+    loop = asyncio.get_event_loop()
+    try:
+        msg = await loop.run_in_executor(None, _refresh_broker_positions, True)
+    except Exception as e:
+        await ctx.send(f"读取 moomoo 持仓失败：`{e}`")
+        return
+    await _send_position(msg)
+    if ctx.channel.id != POSITION_CHANNEL_ID:
+        await ctx.send("实际持仓已发送到 position channel。")
 
 
 @bot.command(name="signal")
@@ -681,6 +699,51 @@ async def cmd_signal(ctx: commands.Context, ticker: str = None):
         await ctx.send(format_predictions(scans))
     else:
         await ctx.send("暂无预测数据（引擎数据不足，请等待 warmup 完成）")
+
+
+@bot.command(name="track")
+async def cmd_track(ctx: commands.Context, ticker: str):
+    """
+    Add a ticker to the continuous interaction-channel tracker.
+    用法: !track SPY
+    """
+    ticker = ticker.upper()
+    if ticker not in SIGNAL_CONFIG:
+        await ctx.send(f"`{ticker}` 未启用。")
+        return
+    tracked_tickers.add(ticker)
+
+    loop = asyncio.get_event_loop()
+    scans = await loop.run_in_executor(None, engine.scan)
+    scans = [s for s in scans if s.ticker == ticker]
+    if scans:
+        await _send_interaction(format_predictions(scans))
+        if ctx.channel.id != INTERACTION_CHANNEL_ID:
+            await ctx.send(f"`{ticker}` 已加入持续追踪，并已发送当前状态到交互频道。")
+    else:
+        await _send_interaction(f"`{ticker}` 已加入持续追踪，但当前暂无预测数据（引擎数据不足）。")
+        if ctx.channel.id != INTERACTION_CHANNEL_ID:
+            await ctx.send(f"`{ticker}` 已加入持续追踪，但当前暂无预测数据。")
+
+
+@bot.command(name="untrack")
+async def cmd_untrack(ctx: commands.Context, ticker: str):
+    """Remove a ticker from the continuous tracker."""
+    ticker = ticker.upper()
+    if ticker in tracked_tickers:
+        tracked_tickers.remove(ticker)
+        await ctx.send(f"`{ticker}` 已停止追踪。")
+    else:
+        await ctx.send(f"`{ticker}` 当前不在追踪列表。")
+
+
+@bot.command(name="tracklist")
+async def cmd_tracklist(ctx: commands.Context):
+    """Show tracked tickers."""
+    if not tracked_tickers:
+        await ctx.send("当前没有持续追踪的 ticker。")
+        return
+    await ctx.send("持续追踪：" + " ".join(f"`{ticker}`" for ticker in sorted(tracked_tickers)))
 
 
 # ── entry point ───────────────────────────────────────────────────────────────
